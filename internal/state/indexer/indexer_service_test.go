@@ -43,7 +43,7 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	logger := tmlog.TestingLogger()
+	logger := tmlog.NewNopLogger()
 	// event bus
 	eventBus := eventbus.NewDefault(logger)
 	err := eventBus.Start(ctx)
@@ -54,8 +54,7 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	assert.False(t, indexer.IndexingEnabled([]indexer.EventSink{}))
 
 	// event sink setup
-	pool, err := setupDB(t)
-	assert.Nil(t, err)
+	pool := setupDB(t)
 
 	store := dbm.NewMemDB()
 	eventSinks := []indexer.EventSink{kv.NewEventSink(store), pSink}
@@ -71,7 +70,7 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	t.Cleanup(service.Wait)
 
 	// publish block with txs
-	err = eventBus.PublishEventNewBlockHeader(ctx, types.EventDataNewBlockHeader{
+	err = eventBus.PublishEventNewBlockHeader(types.EventDataNewBlockHeader{
 		Header: types.Header{Height: 1},
 		NumTxs: int64(2),
 	})
@@ -80,17 +79,17 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 		Height: 1,
 		Index:  uint32(0),
 		Tx:     types.Tx("foo"),
-		Result: abci.ResponseDeliverTx{Code: 0},
+		Result: abci.ExecTxResult{Code: 0},
 	}
-	err = eventBus.PublishEventTx(ctx, types.EventDataTx{TxResult: *txResult1})
+	err = eventBus.PublishEventTx(types.EventDataTx{TxResult: *txResult1})
 	require.NoError(t, err)
 	txResult2 := &abci.TxResult{
 		Height: 1,
 		Index:  uint32(1),
 		Tx:     types.Tx("bar"),
-		Result: abci.ResponseDeliverTx{Code: 0},
+		Result: abci.ExecTxResult{Code: 0},
 	}
-	err = eventBus.PublishEventTx(ctx, types.EventDataTx{TxResult: *txResult2})
+	err = eventBus.PublishEventTx(types.EventDataTx{TxResult: *txResult2})
 	require.NoError(t, err)
 
 	time.Sleep(100 * time.Millisecond)
@@ -126,17 +125,20 @@ func readSchema() ([]*schema.Migration, error) {
 func resetDB(t *testing.T) {
 	q := "DROP TABLE IF EXISTS block_events,tx_events,tx_results"
 	_, err := psqldb.Exec(q)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	q = "DROP TYPE IF EXISTS block_event_type"
 	_, err = psqldb.Exec(q)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 }
 
-func setupDB(t *testing.T) (*dockertest.Pool, error) {
+func setupDB(t *testing.T) *dockertest.Pool {
 	t.Helper()
 	pool, err := dockertest.NewPool(os.Getenv("DOCKER_URL"))
-	assert.Nil(t, err)
+	assert.NoError(t, err)
+	if _, err := pool.Client.Info(); err != nil {
+		t.Skipf("WARNING: Docker is not available: %v [skipping this test]", err)
+	}
 
 	resource, err = pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: "postgres",
@@ -156,7 +158,7 @@ func setupDB(t *testing.T) (*dockertest.Pool, error) {
 		}
 	})
 
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	// Set the container to expire in a minute to avoid orphaned containers
 	// hanging around
@@ -178,13 +180,13 @@ func setupDB(t *testing.T) (*dockertest.Pool, error) {
 	resetDB(t)
 
 	sm, err := readSchema()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	migrator := schema.NewMigrator()
 	err = migrator.Apply(psqldb, sm)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
-	return pool, nil
+	return pool
 }
 
 func teardown(t *testing.T, pool *dockertest.Pool) error {

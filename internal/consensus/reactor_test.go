@@ -2,9 +2,9 @@ package consensus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"path"
 	"sync"
 	"testing"
 	"time"
@@ -81,7 +81,24 @@ func setup(
 	rts.voteSetBitsChannels = rts.network.MakeChannelsNoCleanup(ctx, t, chDesc(VoteSetBitsChannel, size))
 
 	ctx, cancel := context.WithCancel(ctx)
-	// Canceled during cleanup (see below).
+	t.Cleanup(cancel)
+
+	chCreator := func(nodeID types.NodeID) p2p.ChannelCreator {
+		return func(ctx context.Context, desc *p2p.ChannelDescriptor) (*p2p.Channel, error) {
+			switch desc.ID {
+			case StateChannel:
+				return rts.stateChannels[nodeID], nil
+			case DataChannel:
+				return rts.dataChannels[nodeID], nil
+			case VoteChannel:
+				return rts.voteChannels[nodeID], nil
+			case VoteSetBitsChannel:
+				return rts.voteSetBitsChannels[nodeID], nil
+			default:
+				return nil, fmt.Errorf("invalid channel; %v", desc.ID)
+			}
+		}
+	}
 
 	i := 0
 	for nodeID, node := range rts.network.Nodes {
@@ -90,15 +107,12 @@ func setup(
 		reactor := NewReactor(
 			state.logger.With("node", nodeID),
 			state,
-			rts.stateChannels[nodeID],
-			rts.dataChannels[nodeID],
-			rts.voteChannels[nodeID],
-			rts.voteSetBitsChannels[nodeID],
-			node.MakePeerUpdates(ctx, t),
+			chCreator(nodeID),
+			func(ctx context.Context) *p2p.PeerUpdates { return node.MakePeerUpdates(ctx, t) },
+			state.eventBus,
 			true,
+			NopMetrics(),
 		)
-
-		reactor.SetEventBus(state.eventBus)
 
 		blocksSub, err := state.eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 			ClientID: testSubscriber,
@@ -126,6 +140,7 @@ func setup(
 
 		require.NoError(t, reactor.Start(ctx))
 		require.True(t, reactor.IsRunning())
+		t.Cleanup(reactor.Wait)
 
 		i++
 	}
@@ -135,10 +150,7 @@ func setup(
 	// start the in-memory network and connect all peers with each other
 	rts.network.Start(ctx, t)
 
-	t.Cleanup(func() {
-		cancel()
-		leaktest.Check(t)
-	})
+	t.Cleanup(leaktest.Check(t))
 
 	return rts
 }
@@ -173,10 +185,17 @@ func waitForAndValidateBlock(
 
 	ctx, cancel := context.WithCancel(bctx)
 	defer cancel()
+
 	fn := func(j int) {
 		msg, err := blocksSubs[j].Next(ctx)
-		if !assert.NoError(t, err) {
-			cancel()
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return
+		case errors.Is(err, context.Canceled):
+			return
+		case err != nil:
+			cancel() // terminate other workers
+			require.NoError(t, err)
 			return
 		}
 
@@ -184,7 +203,11 @@ func waitForAndValidateBlock(
 		require.NoError(t, validateBlock(newBlock, activeVals))
 
 		for _, tx := range txs {
-			require.NoError(t, assertMempool(states[j].txNotifier).CheckTx(ctx, tx, nil, mempool.TxInfo{}))
+			err := assertMempool(t, states[j].txNotifier).CheckTx(ctx, tx, nil, mempool.TxInfo{})
+			if errors.Is(err, types.ErrTxInCache) {
+				continue
+			}
+			require.NoError(t, err)
 		}
 	}
 
@@ -198,6 +221,10 @@ func waitForAndValidateBlock(
 	}
 
 	wg.Wait()
+
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
 }
 
 func waitForAndValidateBlockWithTx(
@@ -217,8 +244,14 @@ func waitForAndValidateBlockWithTx(
 		ntxs := 0
 		for {
 			msg, err := blocksSubs[j].Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				cancel() // terminate other workers
+				t.Fatalf("problem waiting for %d subscription: %v", j, err)
 				return
 			}
 
@@ -249,6 +282,9 @@ func waitForAndValidateBlockWithTx(
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
 }
 
 func waitForBlockWithUpdatedValsAndValidateIt(
@@ -268,8 +304,14 @@ func waitForBlockWithUpdatedValsAndValidateIt(
 
 		for {
 			msg, err := blocksSubs[j].Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				cancel() // terminate other workers
+				t.Fatalf("problem waiting for %d subscription: %v", j, err)
 				return
 			}
 
@@ -292,6 +334,9 @@ func waitForBlockWithUpdatedValsAndValidateIt(
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
 }
 
 func ensureBlockSyncStatus(t *testing.T, msg tmpubsub.Message, complete bool, height int64) {
@@ -304,15 +349,15 @@ func ensureBlockSyncStatus(t *testing.T, msg tmpubsub.Message, complete bool, he
 }
 
 func TestReactorBasic(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(ctx, t,
+	n := 2
+	states, cleanup := makeConsensusState(ctx, t,
 		cfg, n, "consensus_reactor_test",
-		newMockTickerFunc(true), newKVStore)
+		newMockTickerFunc(true))
 	t.Cleanup(cleanup)
 
 	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
@@ -323,6 +368,8 @@ func TestReactorBasic(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	errCh := make(chan error, len(rts.subs))
+
 	for _, sub := range rts.subs {
 		wg.Add(1)
 
@@ -330,14 +377,32 @@ func TestReactorBasic(t *testing.T) {
 		go func(s eventbus.Subscription) {
 			defer wg.Done()
 			_, err := s.Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				errCh <- err
+				cancel() // terminate other workers
+				return
 			}
 		}(sub)
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+	}
 
+	errCh = make(chan error, len(rts.blocksyncSubs))
 	for _, sub := range rts.blocksyncSubs {
 		wg.Add(1)
 
@@ -345,8 +410,14 @@ func TestReactorBasic(t *testing.T) {
 		go func(s eventbus.Subscription) {
 			defer wg.Done()
 			msg, err := s.Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				errCh <- err
+				cancel() // terminate other workers
 				return
 			}
 			ensureBlockSyncStatus(t, msg, true, 0)
@@ -354,20 +425,31 @@ func TestReactorBasic(t *testing.T) {
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+	}
 }
 
 func TestReactorWithEvidence(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
 	cfg := configSetup(t)
 
-	n := 4
+	n := 2
 	testName := "consensus_reactor_test"
 	tickerFunc := newMockTickerFunc(true)
-	appFunc := newKVStore
 
-	genDoc, privVals := factory.RandGenesisDoc(cfg, n, false, 30)
+	valSet, privVals := factory.ValidatorSet(ctx, t, n, 30)
+	genDoc := factory.GenesisDoc(cfg, time.Now(), valSet.Validators, factory.ConsensusParams())
 	states := make([]*State, n)
 	logger := consensusLogger()
 
@@ -376,13 +458,13 @@ func TestReactorWithEvidence(t *testing.T) {
 		stateStore := sm.NewStore(stateDB)
 		state, err := sm.MakeGenesisState(genDoc)
 		require.NoError(t, err)
-		thisConfig, err := ResetConfig(fmt.Sprintf("%s_%d", testName, i))
+		require.NoError(t, stateStore.Save(state))
+		thisConfig, err := ResetConfig(t.TempDir(), fmt.Sprintf("%s_%d", testName, i))
 		require.NoError(t, err)
 
 		defer os.RemoveAll(thisConfig.RootDir)
 
-		ensureDir(path.Dir(thisConfig.Consensus.WalFile()), 0700) // dir for wal
-		app := appFunc()
+		app := kvstore.NewApplication()
 		vals := types.TM2PB.ValidatorUpdates(state.Validators)
 		app.InitChain(abci.RequestInitChain{Validators: vals})
 
@@ -391,15 +473,13 @@ func TestReactorWithEvidence(t *testing.T) {
 		blockStore := store.NewBlockStore(blockDB)
 
 		// one for mempool, one for consensus
-		mtx := new(sync.Mutex)
-		proxyAppConnMem := abciclient.NewLocalClient(logger, mtx, app)
-		proxyAppConnCon := abciclient.NewLocalClient(logger, mtx, app)
+		proxyAppConnMem := abciclient.NewLocalClient(logger, app)
+		proxyAppConnCon := abciclient.NewLocalClient(logger, app)
 
 		mempool := mempool.NewTxMempool(
-			log.TestingLogger().With("module", "mempool"),
+			log.NewNopLogger().With("module", "mempool"),
 			thisConfig.Mempool,
 			proxyAppConnMem,
-			0,
 		)
 
 		if thisConfig.Consensus.WaitForTxs() {
@@ -410,23 +490,25 @@ func TestReactorWithEvidence(t *testing.T) {
 		// everyone includes evidence of another double signing
 		vIdx := (i + 1) % n
 
-		ev := types.NewMockDuplicateVoteEvidenceWithValidator(1, defaultTestTime, privVals[vIdx], cfg.ChainID())
+		ev, err := types.NewMockDuplicateVoteEvidenceWithValidator(ctx, 1, defaultTestTime, privVals[vIdx], cfg.ChainID())
+		require.NoError(t, err)
 		evpool := &statemocks.EvidencePool{}
-		evpool.On("CheckEvidence", mock.AnythingOfType("types.EvidenceList")).Return(nil)
+		evpool.On("CheckEvidence", ctx, mock.AnythingOfType("types.EvidenceList")).Return(nil)
 		evpool.On("PendingEvidence", mock.AnythingOfType("int64")).Return([]types.Evidence{
 			ev}, int64(len(ev.Bytes())))
-		evpool.On("Update", mock.AnythingOfType("state.State"), mock.AnythingOfType("types.EvidenceList")).Return()
+		evpool.On("Update", ctx, mock.AnythingOfType("state.State"), mock.AnythingOfType("types.EvidenceList")).Return()
 
 		evpool2 := sm.EmptyEvidencePool{}
 
-		blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyAppConnCon, mempool, evpool, blockStore)
-		cs := NewState(ctx, logger.With("validator", i, "module", "consensus"),
-			thisConfig.Consensus, state, blockExec, blockStore, mempool, evpool2)
-		cs.SetPrivValidator(ctx, pv)
-
-		eventBus := eventbus.NewDefault(log.TestingLogger().With("module", "events"))
+		eventBus := eventbus.NewDefault(log.NewNopLogger().With("module", "events"))
 		require.NoError(t, eventBus.Start(ctx))
-		cs.SetEventBus(eventBus)
+
+		blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), proxyAppConnCon, mempool, evpool, blockStore, eventBus, sm.NopMetrics())
+
+		cs, err := NewState(logger.With("validator", i, "module", "consensus"),
+			thisConfig.Consensus, stateStore, blockExec, blockStore, mempool, evpool2, eventBus)
+		require.NoError(t, err)
+		cs.SetPrivValidator(ctx, pv)
 
 		cs.SetTimeoutTicker(tickerFunc())
 
@@ -455,7 +537,7 @@ func TestReactorWithEvidence(t *testing.T) {
 			}
 
 			block := msg.Data().(types.EventDataNewBlock).Block
-			require.Len(t, block.Evidence.Evidence, 1)
+			require.Len(t, block.Evidence, 1)
 		}(sub)
 	}
 
@@ -463,25 +545,22 @@ func TestReactorWithEvidence(t *testing.T) {
 }
 
 func TestReactorCreatesBlockWhenEmptyBlocksFalse(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(
-		ctx,
+	n := 2
+	states, cleanup := makeConsensusState(ctx,
 		t,
 		cfg,
 		n,
 		"consensus_reactor_test",
 		newMockTickerFunc(true),
-		newKVStore,
 		func(c *config.Config) {
 			c.Consensus.CreateEmptyBlocks = false
 		},
 	)
-
 	t.Cleanup(cleanup)
 
 	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
@@ -494,7 +573,7 @@ func TestReactorCreatesBlockWhenEmptyBlocksFalse(t *testing.T) {
 	// send a tx
 	require.NoError(
 		t,
-		assertMempool(states[3].txNotifier).CheckTx(
+		assertMempool(t, states[1].txNotifier).CheckTx(
 			ctx,
 			[]byte{1, 2, 3},
 			nil,
@@ -520,15 +599,15 @@ func TestReactorCreatesBlockWhenEmptyBlocksFalse(t *testing.T) {
 }
 
 func TestReactorRecordsVotesAndBlockParts(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(ctx, t,
+	n := 2
+	states, cleanup := makeConsensusState(ctx, t,
 		cfg, n, "consensus_reactor_test",
-		newMockTickerFunc(true), newKVStore)
+		newMockTickerFunc(true))
 	t.Cleanup(cleanup)
 
 	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
@@ -585,20 +664,18 @@ func TestReactorRecordsVotesAndBlockParts(t *testing.T) {
 }
 
 func TestReactorVotingPowerChange(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(
-		ctx,
+	n := 2
+	states, cleanup := makeConsensusState(ctx,
 		t,
 		cfg,
 		n,
 		"consensus_voting_power_changes_test",
 		newMockTickerFunc(true),
-		newPersistentKVStore,
 	)
 
 	t.Cleanup(cleanup)
@@ -693,7 +770,7 @@ func TestReactorVotingPowerChange(t *testing.T) {
 }
 
 func TestReactorValidatorSetChanges(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	cfg := configSetup(t)
@@ -702,12 +779,13 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 	nVals := 4
 	states, _, _, cleanup := randConsensusNetWithPeers(
 		ctx,
+		t,
 		cfg,
 		nVals,
 		nPeers,
 		"consensus_val_set_changes_test",
 		newMockTickerFunc(true),
-		newPersistentKVStoreWithPath,
+		newEpehemeralKVStore,
 	)
 	t.Cleanup(cleanup)
 
@@ -721,7 +799,7 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 	// map of active validators
 	activeVals := make(map[string]struct{})
 	for i := 0; i < nVals; i++ {
-		pubKey, err := states[i].privValidator.GetPubKey(context.Background())
+		pubKey, err := states[i].privValidator.GetPubKey(ctx)
 		require.NoError(t, err)
 
 		activeVals[string(pubKey.Address())] = struct{}{}
@@ -735,13 +813,28 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 		go func(s eventbus.Subscription) {
 			defer wg.Done()
 			_, err := s.Next(ctx)
-			if !assert.NoError(t, err) {
+			switch {
+			case err == nil:
+			case errors.Is(err, context.DeadlineExceeded):
+			default:
+				t.Log(err)
 				cancel()
 			}
 		}(sub)
 	}
 
 	wg.Wait()
+
+	// after the wait returns, either there was an error with a
+	// subscription (very unlikely, and causes the context to be
+	// canceled manually), there was a timeout and the test's root context
+	// was canceled (somewhat likely,) or the test can proceed
+	// (common.)
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	} else if errors.Is(err, context.Canceled) {
+		t.Fatal("subscription encountered unexpected error")
+	}
 
 	newValidatorPubKey1, err := states[nVals].privValidator.GetPubKey(ctx)
 	require.NoError(t, err)

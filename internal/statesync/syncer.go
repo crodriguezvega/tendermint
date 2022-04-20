@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
+	abciclient "github.com/tendermint/tendermint/abci/client"
 	abci "github.com/tendermint/tendermint/abci/types"
-	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/internal/p2p"
 	"github.com/tendermint/tendermint/internal/proxy"
 	sm "github.com/tendermint/tendermint/internal/state"
@@ -54,8 +54,7 @@ var (
 type syncer struct {
 	logger        log.Logger
 	stateProvider StateProvider
-	conn          proxy.AppConnSnapshot
-	connQuery     proxy.AppConnQuery
+	conn          abciclient.Client
 	snapshots     *snapshotPool
 	snapshotCh    *p2p.Channel
 	chunkCh       *p2p.Channel
@@ -70,33 +69,6 @@ type syncer struct {
 	avgChunkTime             int64
 	lastSyncedSnapshotHeight int64
 	processingSnapshot       *snapshot
-}
-
-// newSyncer creates a new syncer.
-func newSyncer(
-	cfg config.StateSyncConfig,
-	logger log.Logger,
-	conn proxy.AppConnSnapshot,
-	connQuery proxy.AppConnQuery,
-	stateProvider StateProvider,
-	snapshotCh *p2p.Channel,
-	chunkCh *p2p.Channel,
-	tempDir string,
-	metrics *Metrics,
-) *syncer {
-	return &syncer{
-		logger:        logger,
-		stateProvider: stateProvider,
-		conn:          conn,
-		connQuery:     connQuery,
-		snapshots:     newSnapshotPool(),
-		snapshotCh:    snapshotCh,
-		chunkCh:       chunkCh,
-		tempDir:       tempDir,
-		fetchers:      cfg.Fetchers,
-		retryTimeout:  cfg.ChunkRequestTimeout,
-		metrics:       metrics,
-	}
 }
 
 // AddChunk adds a chunk to the chunk queue, if any. It returns false if the chunk has already
@@ -348,12 +320,10 @@ func (s *syncer) Sync(ctx context.Context, snapshot *snapshot, chunks *chunkQueu
 		return sm.State{}, nil, err
 	}
 
-	// Verify app and update app version
-	appVersion, err := s.verifyApp(ctx, snapshot)
-	if err != nil {
+	// Verify app and app version
+	if err := s.verifyApp(ctx, snapshot, state.Version.Consensus.App); err != nil {
 		return sm.State{}, nil, err
 	}
-	state.Version.Consensus.App = appVersion
 
 	// Done! 🎉
 	s.logger.Info("Snapshot restored", "height", snapshot.Height, "format", snapshot.Format,
@@ -367,7 +337,7 @@ func (s *syncer) Sync(ctx context.Context, snapshot *snapshot, chunks *chunkQueu
 func (s *syncer) offerSnapshot(ctx context.Context, snapshot *snapshot) error {
 	s.logger.Info("Offering snapshot to ABCI app", "height", snapshot.Height,
 		"format", snapshot.Format, "hash", snapshot.Hash)
-	resp, err := s.conn.OfferSnapshotSync(ctx, abci.RequestOfferSnapshot{
+	resp, err := s.conn.OfferSnapshot(ctx, abci.RequestOfferSnapshot{
 		Snapshot: &abci.Snapshot{
 			Height:   snapshot.Height,
 			Format:   snapshot.Format,
@@ -409,7 +379,7 @@ func (s *syncer) applyChunks(ctx context.Context, chunks *chunkQueue, start time
 			return fmt.Errorf("failed to fetch chunk: %w", err)
 		}
 
-		resp, err := s.conn.ApplySnapshotChunkSync(ctx, abci.RequestApplySnapshotChunk{
+		resp, err := s.conn.ApplySnapshotChunk(ctx, abci.RequestApplySnapshotChunk{
 			Index:  chunk.Index,
 			Chunk:  chunk.Chunk,
 			Sender: string(chunk.Sender),
@@ -547,19 +517,27 @@ func (s *syncer) requestChunk(ctx context.Context, snapshot *snapshot, chunk uin
 	return nil
 }
 
-// verifyApp verifies the sync, checking the app hash and last block height. It returns the
-// app version, which should be returned as part of the initial state.
-func (s *syncer) verifyApp(ctx context.Context, snapshot *snapshot) (uint64, error) {
-	resp, err := s.connQuery.InfoSync(ctx, proxy.RequestInfo)
+// verifyApp verifies the sync, checking the app hash, last block height and app version
+func (s *syncer) verifyApp(ctx context.Context, snapshot *snapshot, appVersion uint64) error {
+	resp, err := s.conn.Info(ctx, proxy.RequestInfo)
 	if err != nil {
-		return 0, fmt.Errorf("failed to query ABCI app for appHash: %w", err)
+		return fmt.Errorf("failed to query ABCI app for appHash: %w", err)
+	}
+
+	// sanity check that the app version in the block matches the application's own record
+	// of its version
+	if resp.AppVersion != appVersion {
+		// An error here most likely means that the app hasn't inplemented state sync
+		// or the Info call correctly
+		return fmt.Errorf("app version mismatch. Expected: %d, got: %d",
+			appVersion, resp.AppVersion)
 	}
 
 	if !bytes.Equal(snapshot.trustedAppHash, resp.LastBlockAppHash) {
 		s.logger.Error("appHash verification failed",
 			"expected", snapshot.trustedAppHash,
 			"actual", resp.LastBlockAppHash)
-		return 0, errVerifyFailed
+		return errVerifyFailed
 	}
 
 	if uint64(resp.LastBlockHeight) != snapshot.Height {
@@ -568,9 +546,9 @@ func (s *syncer) verifyApp(ctx context.Context, snapshot *snapshot) (uint64, err
 			"expected", snapshot.Height,
 			"actual", resp.LastBlockHeight,
 		)
-		return 0, errVerifyFailed
+		return errVerifyFailed
 	}
 
 	s.logger.Info("Verified ABCI app", "height", snapshot.Height, "appHash", snapshot.trustedAppHash)
-	return resp.AppVersion, nil
+	return nil
 }

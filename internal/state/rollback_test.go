@@ -1,6 +1,7 @@
 package state_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -18,6 +19,7 @@ func TestRollback(t *testing.T) {
 		height     int64 = 100
 		nextHeight int64 = 101
 	)
+
 	blockStore := &mocks.BlockStore{}
 	stateStore := setupStateStore(t, height)
 	initialState, err := stateStore.Load()
@@ -46,12 +48,22 @@ func TestRollback(t *testing.T) {
 		BlockID: initialState.LastBlockID,
 		Header: types.Header{
 			Height:          initialState.LastBlockHeight,
-			AppHash:         initialState.AppHash,
+			AppHash:         factory.RandomHash(),
 			LastBlockID:     factory.MakeBlockID(),
 			LastResultsHash: initialState.LastResultsHash,
 		},
 	}
-	blockStore.On("LoadBlockMeta", initialState.LastBlockHeight).Return(block)
+	nextBlock := &types.BlockMeta{
+		BlockID: initialState.LastBlockID,
+		Header: types.Header{
+			Height:          nextState.LastBlockHeight,
+			AppHash:         initialState.AppHash,
+			LastBlockID:     block.BlockID,
+			LastResultsHash: nextState.LastResultsHash,
+		},
+	}
+	blockStore.On("LoadBlockMeta", height).Return(block)
+	blockStore.On("LoadBlockMeta", nextHeight).Return(nextBlock)
 	blockStore.On("Height").Return(nextHeight)
 
 	// rollback the state
@@ -78,9 +90,11 @@ func TestRollbackNoState(t *testing.T) {
 
 func TestRollbackNoBlocks(t *testing.T) {
 	const height = int64(100)
+
 	stateStore := setupStateStore(t, height)
 	blockStore := &mocks.BlockStore{}
 	blockStore.On("Height").Return(height)
+	blockStore.On("LoadBlockMeta", height).Return(nil)
 	blockStore.On("LoadBlockMeta", height-1).Return(nil)
 
 	_, _, err := state.Rollback(blockStore, stateStore)
@@ -101,7 +115,9 @@ func TestRollbackDifferentStateHeight(t *testing.T) {
 
 func setupStateStore(t *testing.T, height int64) state.Store {
 	stateStore := state.NewStore(dbm.NewMemDB())
-	valSet, _ := factory.RandValidatorSet(5, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	valSet, _ := factory.ValidatorSet(ctx, t, 5, 10)
 
 	params := types.DefaultConsensusParams()
 	params.Version.AppVersion = 10

@@ -35,7 +35,7 @@ func New(
 	ctx context.Context,
 	conf *config.Config,
 	logger log.Logger,
-	cf abciclient.Creator,
+	cf abciclient.Client,
 	gen *types.GenesisDoc,
 ) (service.Service, error) {
 	nodeKey, err := types.LoadOrGenNodeKey(conf.NodeKeyFile())
@@ -68,7 +68,7 @@ func New(
 			config.DefaultDBProvider,
 			logger)
 	case config.ModeSeed:
-		return makeSeedNode(ctx, conf, config.DefaultDBProvider, nodeKey, genProvider, logger)
+		return makeSeedNode(logger, conf, config.DefaultDBProvider, nodeKey, genProvider)
 	default:
 		return nil, fmt.Errorf("%q is not a valid mode", conf.Mode)
 	}

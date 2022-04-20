@@ -20,7 +20,7 @@ import (
 func init() {
 	testTransports["mconn"] = func(t *testing.T) p2p.Transport {
 		transport := p2p.NewMConnTransport(
-			log.TestingLogger(),
+			log.NewNopLogger(),
 			conn.DefaultMConnConfig(),
 			[]*p2p.ChannelDescriptor{{ID: chID, Priority: 1}},
 			p2p.MConnTransportOptions{},
@@ -32,9 +32,7 @@ func init() {
 		})
 		require.NoError(t, err)
 
-		t.Cleanup(func() {
-			require.NoError(t, transport.Close())
-		})
+		t.Cleanup(func() { _ = transport.Close() })
 
 		return transport
 	}
@@ -42,7 +40,7 @@ func init() {
 
 func TestMConnTransport_AcceptBeforeListen(t *testing.T) {
 	transport := p2p.NewMConnTransport(
-		log.TestingLogger(),
+		log.NewNopLogger(),
 		conn.DefaultMConnConfig(),
 		[]*p2p.ChannelDescriptor{{ID: chID, Priority: 1}},
 		p2p.MConnTransportOptions{
@@ -65,7 +63,7 @@ func TestMConnTransport_AcceptMaxAcceptedConnections(t *testing.T) {
 	defer cancel()
 
 	transport := p2p.NewMConnTransport(
-		log.TestingLogger(),
+		log.NewNopLogger(),
 		conn.DefaultMConnConfig(),
 		[]*p2p.ChannelDescriptor{{ID: chID, Priority: 1}},
 		p2p.MConnTransportOptions{
@@ -154,11 +152,8 @@ func TestMConnTransport_Listen(t *testing.T) {
 		t.Run(tc.endpoint.String(), func(t *testing.T) {
 			t.Cleanup(leaktest.Check(t))
 
-			ctx, cancel = context.WithCancel(ctx)
-			defer cancel()
-
 			transport := p2p.NewMConnTransport(
-				log.TestingLogger(),
+				log.NewNopLogger(),
 				conn.DefaultMConnConfig(),
 				[]*p2p.ChannelDescriptor{{ID: chID, Priority: 1}},
 				p2p.MConnTransportOptions{},

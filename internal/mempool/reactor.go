@@ -10,7 +10,6 @@ import (
 
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/internal/libs/clist"
-	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
 	"github.com/tendermint/tendermint/internal/p2p"
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/libs/service"
@@ -41,46 +40,37 @@ type Reactor struct {
 	mempool *TxMempool
 	ids     *IDs
 
-	// XXX: Currently, this is the only way to get information about a peer. Ideally,
-	// we rely on message-oriented communication to get necessary peer data.
-	// ref: https://github.com/tendermint/tendermint/issues/5670
-	peerMgr PeerManager
-
-	mempoolCh   *p2p.Channel
-	peerUpdates *p2p.PeerUpdates
-
-	// peerWG is used to coordinate graceful termination of all peer broadcasting
-	// goroutines.
-	peerWG sync.WaitGroup
+	getPeerHeight func(types.NodeID) int64
+	peerEvents    p2p.PeerEventSubscriber
+	chCreator     p2p.ChannelCreator
 
 	// observePanic is a function for observing panics that were recovered in methods on
 	// Reactor. observePanic is called with the recovered value.
 	observePanic func(interface{})
 
 	mtx          sync.Mutex
-	peerRoutines map[types.NodeID]*tmsync.Closer
+	peerRoutines map[types.NodeID]context.CancelFunc
 }
 
 // NewReactor returns a reference to a new reactor.
 func NewReactor(
 	logger log.Logger,
 	cfg *config.MempoolConfig,
-	peerMgr PeerManager,
 	txmp *TxMempool,
-	mempoolCh *p2p.Channel,
-	peerUpdates *p2p.PeerUpdates,
+	chCreator p2p.ChannelCreator,
+	peerEvents p2p.PeerEventSubscriber,
+	getPeerHeight func(types.NodeID) int64,
 ) *Reactor {
-
 	r := &Reactor{
-		logger:       logger,
-		cfg:          cfg,
-		peerMgr:      peerMgr,
-		mempool:      txmp,
-		ids:          NewMempoolIDs(),
-		mempoolCh:    mempoolCh,
-		peerUpdates:  peerUpdates,
-		peerRoutines: make(map[types.NodeID]*tmsync.Closer),
-		observePanic: defaultObservePanic,
+		logger:        logger,
+		cfg:           cfg,
+		mempool:       txmp,
+		ids:           NewMempoolIDs(),
+		chCreator:     chCreator,
+		peerEvents:    peerEvents,
+		getPeerHeight: getPeerHeight,
+		peerRoutines:  make(map[types.NodeID]context.CancelFunc),
+		observePanic:  defaultObservePanic,
 	}
 
 	r.BaseService = *service.NewBaseService(logger, "Mempool", r)
@@ -89,9 +79,9 @@ func NewReactor(
 
 func defaultObservePanic(r interface{}) {}
 
-// GetChannelDescriptor produces an instance of a descriptor for this
+// getChannelDescriptor produces an instance of a descriptor for this
 // package's required channels.
-func GetChannelDescriptor(cfg *config.MempoolConfig) *p2p.ChannelDescriptor {
+func getChannelDescriptor(cfg *config.MempoolConfig) *p2p.ChannelDescriptor {
 	largestTx := make([]byte, cfg.MaxTxBytes)
 	batchMsg := protomem.Message{
 		Sum: &protomem.Message_Txs{
@@ -105,6 +95,7 @@ func GetChannelDescriptor(cfg *config.MempoolConfig) *p2p.ChannelDescriptor {
 		Priority:            5,
 		RecvMessageCapacity: batchMsg.Size(),
 		RecvBufferCapacity:  128,
+		Name:                "mempool",
 	}
 }
 
@@ -117,24 +108,20 @@ func (r *Reactor) OnStart(ctx context.Context) error {
 		r.logger.Info("tx broadcasting is disabled")
 	}
 
-	go r.processMempoolCh(ctx)
-	go r.processPeerUpdates(ctx)
+	ch, err := r.chCreator(ctx, getChannelDescriptor(r.cfg))
+	if err != nil {
+		return err
+	}
+
+	go r.processMempoolCh(ctx, ch)
+	go r.processPeerUpdates(ctx, r.peerEvents(ctx), ch)
 
 	return nil
 }
 
 // OnStop stops the reactor by signaling to all spawned goroutines to exit and
 // blocking until they all exit.
-func (r *Reactor) OnStop() {
-	r.mtx.Lock()
-	for _, c := range r.peerRoutines {
-		c.Close()
-	}
-	r.mtx.Unlock()
-
-	// wait for all spawned peer tx broadcasting goroutines to gracefully exit
-	r.peerWG.Wait()
-}
+func (r *Reactor) OnStop() {}
 
 // handleMempoolMessage handles envelopes sent from peers on the MempoolChannel.
 // For every tx in the message, we execute CheckTx. It returns an error if an
@@ -157,7 +144,18 @@ func (r *Reactor) handleMempoolMessage(ctx context.Context, envelope *p2p.Envelo
 
 		for _, tx := range protoTxs {
 			if err := r.mempool.CheckTx(ctx, types.Tx(tx), nil, txInfo); err != nil {
-				logger.Error("checktx failed for tx", "tx", fmt.Sprintf("%X", types.Tx(tx).Hash()), "err", err)
+				if errors.Is(err, types.ErrTxInCache) {
+					// if the tx is in the cache,
+					// then we've been gossiped a
+					// Tx that we've already
+					// got. Gossip should be
+					// smarter, but it's not a
+					// problem.
+					continue
+				}
+				logger.Error("checktx failed for tx",
+					"tx", fmt.Sprintf("%X", types.Tx(tx).Hash()),
+					"err", err)
 			}
 		}
 
@@ -199,13 +197,13 @@ func (r *Reactor) handleMessage(ctx context.Context, chID p2p.ChannelID, envelop
 
 // processMempoolCh implements a blocking event loop where we listen for p2p
 // Envelope messages from the mempoolCh.
-func (r *Reactor) processMempoolCh(ctx context.Context) {
-	iter := r.mempoolCh.Receive(ctx)
+func (r *Reactor) processMempoolCh(ctx context.Context, mempoolCh *p2p.Channel) {
+	iter := mempoolCh.Receive(ctx)
 	for iter.Next(ctx) {
 		envelope := iter.Envelope()
-		if err := r.handleMessage(ctx, r.mempoolCh.ID, envelope); err != nil {
-			r.logger.Error("failed to process message", "ch_id", r.mempoolCh.ID, "envelope", envelope, "err", err)
-			if serr := r.mempoolCh.SendError(ctx, p2p.PeerError{
+		if err := r.handleMessage(ctx, mempoolCh.ID, envelope); err != nil {
+			r.logger.Error("failed to process message", "ch_id", mempoolCh.ID, "envelope", envelope, "err", err)
+			if serr := mempoolCh.SendError(ctx, p2p.PeerError{
 				NodeID: envelope.From,
 				Err:    err,
 			}); serr != nil {
@@ -220,7 +218,7 @@ func (r *Reactor) processMempoolCh(ctx context.Context) {
 // goroutine or not. If not, we start one for the newly added peer. For down or
 // removed peers, we remove the peer from the mempool peer ID set and signal to
 // stop the tx broadcasting goroutine.
-func (r *Reactor) processPeerUpdate(ctx context.Context, peerUpdate p2p.PeerUpdate) {
+func (r *Reactor) processPeerUpdate(ctx context.Context, peerUpdate p2p.PeerUpdate, mempoolCh *p2p.Channel) {
 	r.logger.Debug("received peer update", "peer", peerUpdate.NodeID, "status", peerUpdate.Status)
 
 	r.mtx.Lock()
@@ -242,15 +240,13 @@ func (r *Reactor) processPeerUpdate(ctx context.Context, peerUpdate p2p.PeerUpda
 			// safely, and finally start the goroutine to broadcast txs to that peer.
 			_, ok := r.peerRoutines[peerUpdate.NodeID]
 			if !ok {
-				closer := tmsync.NewCloser()
-
-				r.peerRoutines[peerUpdate.NodeID] = closer
-				r.peerWG.Add(1)
+				pctx, pcancel := context.WithCancel(ctx)
+				r.peerRoutines[peerUpdate.NodeID] = pcancel
 
 				r.ids.ReserveForPeer(peerUpdate.NodeID)
 
 				// start a broadcast routine ensuring all txs are forwarded to the peer
-				go r.broadcastTxRoutine(ctx, peerUpdate.NodeID, closer)
+				go r.broadcastTxRoutine(pctx, peerUpdate.NodeID, mempoolCh)
 			}
 		}
 
@@ -263,7 +259,7 @@ func (r *Reactor) processPeerUpdate(ctx context.Context, peerUpdate p2p.PeerUpda
 		// from the map of peer tx broadcasting goroutines.
 		closer, ok := r.peerRoutines[peerUpdate.NodeID]
 		if ok {
-			closer.Close()
+			closer()
 		}
 	}
 }
@@ -271,19 +267,18 @@ func (r *Reactor) processPeerUpdate(ctx context.Context, peerUpdate p2p.PeerUpda
 // processPeerUpdates initiates a blocking process where we listen for and handle
 // PeerUpdate messages. When the reactor is stopped, we will catch the signal and
 // close the p2p PeerUpdatesCh gracefully.
-func (r *Reactor) processPeerUpdates(ctx context.Context) {
+func (r *Reactor) processPeerUpdates(ctx context.Context, peerUpdates *p2p.PeerUpdates, mempoolCh *p2p.Channel) {
 	for {
 		select {
 		case <-ctx.Done():
-			r.logger.Debug("stopped listening on peer updates channel; closing...")
 			return
-		case peerUpdate := <-r.peerUpdates.Updates():
-			r.processPeerUpdate(ctx, peerUpdate)
+		case peerUpdate := <-peerUpdates.Updates():
+			r.processPeerUpdate(ctx, peerUpdate, mempoolCh)
 		}
 	}
 }
 
-func (r *Reactor) broadcastTxRoutine(ctx context.Context, peerID types.NodeID, closer *tmsync.Closer) {
+func (r *Reactor) broadcastTxRoutine(ctx context.Context, peerID types.NodeID, mempoolCh *p2p.Channel) {
 	peerMempoolID := r.ids.GetForPeer(peerID)
 	var nextGossipTx *clist.CElement
 
@@ -292,8 +287,6 @@ func (r *Reactor) broadcastTxRoutine(ctx context.Context, peerID types.NodeID, c
 		r.mtx.Lock()
 		delete(r.peerRoutines, peerID)
 		r.mtx.Unlock()
-
-		r.peerWG.Done()
 
 		if e := recover(); e != nil {
 			r.observePanic(e)
@@ -321,18 +314,13 @@ func (r *Reactor) broadcastTxRoutine(ctx context.Context, peerID types.NodeID, c
 				if nextGossipTx = r.mempool.NextGossipTx(); nextGossipTx == nil {
 					continue
 				}
-
-			case <-closer.Done():
-				// The peer is marked for removal via a PeerUpdate as the doneCh was
-				// explicitly closed to signal we should exit.
-				return
 			}
 		}
 
 		memTx := nextGossipTx.Value.(*WrappedTx)
 
-		if r.peerMgr != nil {
-			height := r.peerMgr.GetHeight(peerID)
+		if r.getPeerHeight != nil {
+			height := r.getPeerHeight(peerID)
 			if height > 0 && height < memTx.height-1 {
 				// allow for a lag of one block
 				time.Sleep(PeerCatchupSleepIntervalMS * time.Millisecond)
@@ -345,7 +333,7 @@ func (r *Reactor) broadcastTxRoutine(ctx context.Context, peerID types.NodeID, c
 		if ok := r.mempool.txStore.TxHasPeer(memTx.hash, peerMempoolID); !ok {
 			// Send the mempool tx to the corresponding peer. Note, the peer may be
 			// behind and thus would not be able to process the mempool tx correctly.
-			if err := r.mempoolCh.Send(ctx, p2p.Envelope{
+			if err := mempoolCh.Send(ctx, p2p.Envelope{
 				To: peerID,
 				Message: &protomem.Txs{
 					Txs: [][]byte{memTx.tx},
@@ -364,10 +352,6 @@ func (r *Reactor) broadcastTxRoutine(ctx context.Context, peerID types.NodeID, c
 		select {
 		case <-nextGossipTx.NextWaitChan():
 			nextGossipTx = nextGossipTx.Next()
-		case <-closer.Done():
-			// The peer is marked for removal via a PeerUpdate as the doneCh was
-			// explicitly closed to signal we should exit.
-			return
 		case <-ctx.Done():
 			return
 		}

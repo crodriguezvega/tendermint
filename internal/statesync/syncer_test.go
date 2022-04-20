@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	clientmocks "github.com/tendermint/tendermint/abci/client/mocks"
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/internal/proxy"
-	proxymocks "github.com/tendermint/tendermint/internal/proxy/mocks"
 	sm "github.com/tendermint/tendermint/internal/state"
 	"github.com/tendermint/tendermint/internal/statesync/mocks"
 	ssproto "github.com/tendermint/tendermint/proto/tendermint/statesync"
@@ -30,7 +30,7 @@ func TestSyncer_SyncAny(t *testing.T) {
 		Version: sm.Version{
 			Consensus: version.Consensus{
 				Block: version.BlockProtocol,
-				App:   0,
+				App:   testAppVersion,
 			},
 			Software: version.TMVersion,
 		},
@@ -62,13 +62,12 @@ func TestSyncer_SyncAny(t *testing.T) {
 	stateProvider.On("AppHash", mock.Anything, uint64(2)).Return([]byte("app_hash_2"), nil)
 	stateProvider.On("Commit", mock.Anything, uint64(1)).Return(commit, nil)
 	stateProvider.On("State", mock.Anything, uint64(1)).Return(state, nil)
-	connSnapshot := &proxymocks.AppConnSnapshot{}
-	connQuery := &proxymocks.AppConnQuery{}
+	conn := &clientmocks.Client{}
 
 	peerAID := types.NodeID("aa")
 	peerBID := types.NodeID("bb")
 	peerCID := types.NodeID("cc")
-	rts := setup(ctx, t, connSnapshot, connQuery, stateProvider, 3)
+	rts := setup(ctx, t, conn, stateProvider, 4)
 
 	rts.reactor.syncer = rts.syncer
 
@@ -110,7 +109,7 @@ func TestSyncer_SyncAny(t *testing.T) {
 
 	// We start a sync, with peers sending back chunks when requested. We first reject the snapshot
 	// with height 2 format 2, and accept the snapshot at height 1.
-	connSnapshot.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: &abci.Snapshot{
 			Height: 2,
 			Format: 2,
@@ -119,7 +118,7 @@ func TestSyncer_SyncAny(t *testing.T) {
 		},
 		AppHash: []byte("app_hash_2"),
 	}).Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_REJECT_FORMAT}, nil)
-	connSnapshot.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: &abci.Snapshot{
 			Height:   s.Height,
 			Format:   s.Format,
@@ -133,52 +132,63 @@ func TestSyncer_SyncAny(t *testing.T) {
 	chunkRequests := make(map[uint32]int)
 	chunkRequestsMtx := sync.Mutex{}
 
-	var wg sync.WaitGroup
-	wg.Add(4)
+	chunkProcessDone := make(chan struct{})
 
 	go func() {
-		for e := range rts.chunkOutCh {
-			msg, ok := e.Message.(*ssproto.ChunkRequest)
-			assert.True(t, ok)
+		defer close(chunkProcessDone)
+		var seen int
+		for {
+			if seen >= 4 {
+				return
+			}
 
-			assert.EqualValues(t, 1, msg.Height)
-			assert.EqualValues(t, 1, msg.Format)
-			assert.LessOrEqual(t, msg.Index, uint32(len(chunks)))
+			select {
+			case <-ctx.Done():
+				t.Logf("sent %d chunks", seen)
+				return
+			case e := <-rts.chunkOutCh:
+				msg, ok := e.Message.(*ssproto.ChunkRequest)
+				assert.True(t, ok)
 
-			added, err := rts.syncer.AddChunk(chunks[msg.Index])
-			assert.NoError(t, err)
-			assert.True(t, added)
+				assert.EqualValues(t, 1, msg.Height)
+				assert.EqualValues(t, 1, msg.Format)
+				assert.LessOrEqual(t, msg.Index, uint32(len(chunks)))
 
-			chunkRequestsMtx.Lock()
-			chunkRequests[msg.Index]++
-			chunkRequestsMtx.Unlock()
+				added, err := rts.syncer.AddChunk(chunks[msg.Index])
+				assert.NoError(t, err)
+				assert.True(t, added)
 
-			wg.Done()
+				chunkRequestsMtx.Lock()
+				chunkRequests[msg.Index]++
+				chunkRequestsMtx.Unlock()
+				seen++
+				t.Logf("added chunk (%d of 4): %d", seen, msg.Index)
+			}
 		}
 	}()
 
 	// The first time we're applying chunk 2 we tell it to retry the snapshot and discard chunk 1,
 	// which should cause it to keep the existing chunk 0 and 2, and restart restoration from
 	// beginning. We also wait for a little while, to exercise the retry logic in fetchChunks().
-	connSnapshot.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+	conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 		Index: 2, Chunk: []byte{1, 1, 2},
-	}).Once().Run(func(args mock.Arguments) { time.Sleep(2 * time.Second) }).Return(
+	}).Once().Run(func(args mock.Arguments) { time.Sleep(1 * time.Second) }).Return(
 		&abci.ResponseApplySnapshotChunk{
 			Result:        abci.ResponseApplySnapshotChunk_RETRY_SNAPSHOT,
 			RefetchChunks: []uint32{1},
 		}, nil)
 
-	connSnapshot.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+	conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 		Index: 0, Chunk: []byte{1, 1, 0},
 	}).Times(2).Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
-	connSnapshot.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+	conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 		Index: 1, Chunk: []byte{1, 1, 1},
 	}).Times(2).Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
-	connSnapshot.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+	conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 		Index: 2, Chunk: []byte{1, 1, 2},
 	}).Once().Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
-	connQuery.On("InfoSync", mock.Anything, proxy.RequestInfo).Return(&abci.ResponseInfo{
-		AppVersion:       9,
+	conn.On("Info", mock.Anything, proxy.RequestInfo).Return(&abci.ResponseInfo{
+		AppVersion:       testAppVersion,
 		LastBlockHeight:  1,
 		LastBlockAppHash: []byte("app_hash"),
 	}, nil)
@@ -186,16 +196,13 @@ func TestSyncer_SyncAny(t *testing.T) {
 	newState, lastCommit, err := rts.syncer.SyncAny(ctx, 0, func() error { return nil })
 	require.NoError(t, err)
 
-	wg.Wait()
+	<-chunkProcessDone
 
 	chunkRequestsMtx.Lock()
 	require.Equal(t, map[uint32]int{0: 1, 1: 2, 2: 1}, chunkRequests)
 	chunkRequestsMtx.Unlock()
 
-	// The syncer should have updated the state app version from the ABCI info response.
 	expectState := state
-	expectState.Version.Consensus.App = 9
-
 	require.Equal(t, expectState, newState)
 	require.Equal(t, commit, lastCommit)
 
@@ -209,8 +216,7 @@ func TestSyncer_SyncAny(t *testing.T) {
 	require.Equal(t, int64(len(rts.syncer.snapshots.snapshots)), rts.reactor.TotalSnapshots())
 	require.Equal(t, int64(0), rts.reactor.SnapshotChunksCount())
 
-	connSnapshot.AssertExpectations(t)
-	connQuery.AssertExpectations(t)
+	conn.AssertExpectations(t)
 }
 
 func TestSyncer_SyncAny_noSnapshots(t *testing.T) {
@@ -220,7 +226,7 @@ func TestSyncer_SyncAny_noSnapshots(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rts := setup(ctx, t, nil, nil, stateProvider, 2)
+	rts := setup(ctx, t, nil, stateProvider, 2)
 
 	_, _, err := rts.syncer.SyncAny(ctx, 0, func() error { return nil })
 	require.Equal(t, errNoSnapshots, err)
@@ -233,7 +239,7 @@ func TestSyncer_SyncAny_abort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rts := setup(ctx, t, nil, nil, stateProvider, 2)
+	rts := setup(ctx, t, nil, stateProvider, 2)
 
 	s := &snapshot{Height: 1, Format: 1, Chunks: 3, Hash: []byte{1, 2, 3}}
 	peerID := types.NodeID("aa")
@@ -241,7 +247,7 @@ func TestSyncer_SyncAny_abort(t *testing.T) {
 	_, err := rts.syncer.AddSnapshot(peerID, s)
 	require.NoError(t, err)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(s), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_ABORT}, nil)
 
@@ -257,7 +263,7 @@ func TestSyncer_SyncAny_reject(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rts := setup(ctx, t, nil, nil, stateProvider, 2)
+	rts := setup(ctx, t, nil, stateProvider, 2)
 
 	// s22 is tried first, then s12, then s11, then errNoSnapshots
 	s22 := &snapshot{Height: 2, Format: 2, Chunks: 3, Hash: []byte{1, 2, 3}}
@@ -275,15 +281,15 @@ func TestSyncer_SyncAny_reject(t *testing.T) {
 	_, err = rts.syncer.AddSnapshot(peerID, s11)
 	require.NoError(t, err)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(s22), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_REJECT}, nil)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(s12), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_REJECT}, nil)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(s11), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_REJECT}, nil)
 
@@ -299,7 +305,7 @@ func TestSyncer_SyncAny_reject_format(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rts := setup(ctx, t, nil, nil, stateProvider, 2)
+	rts := setup(ctx, t, nil, stateProvider, 2)
 
 	// s22 is tried first, which reject s22 and s12, then s11 will abort.
 	s22 := &snapshot{Height: 2, Format: 2, Chunks: 3, Hash: []byte{1, 2, 3}}
@@ -317,11 +323,11 @@ func TestSyncer_SyncAny_reject_format(t *testing.T) {
 	_, err = rts.syncer.AddSnapshot(peerID, s11)
 	require.NoError(t, err)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(s22), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_REJECT_FORMAT}, nil)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(s11), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_ABORT}, nil)
 
@@ -337,7 +343,7 @@ func TestSyncer_SyncAny_reject_sender(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rts := setup(ctx, t, nil, nil, stateProvider, 2)
+	rts := setup(ctx, t, nil, stateProvider, 2)
 
 	peerAID := types.NodeID("aa")
 	peerBID := types.NodeID("bb")
@@ -366,11 +372,11 @@ func TestSyncer_SyncAny_reject_sender(t *testing.T) {
 	_, err = rts.syncer.AddSnapshot(peerCID, sbc)
 	require.NoError(t, err)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(sbc), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_REJECT_SENDER}, nil)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(sa), AppHash: []byte("app_hash"),
 	}).Once().Return(&abci.ResponseOfferSnapshot{Result: abci.ResponseOfferSnapshot_REJECT}, nil)
 
@@ -386,7 +392,7 @@ func TestSyncer_SyncAny_abciError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rts := setup(ctx, t, nil, nil, stateProvider, 2)
+	rts := setup(ctx, t, nil, stateProvider, 2)
 
 	errBoom := errors.New("boom")
 	s := &snapshot{Height: 1, Format: 1, Chunks: 3, Hash: []byte{1, 2, 3}}
@@ -396,7 +402,7 @@ func TestSyncer_SyncAny_abciError(t *testing.T) {
 	_, err := rts.syncer.AddSnapshot(peerID, s)
 	require.NoError(t, err)
 
-	rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+	rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 		Snapshot: toABCI(s), AppHash: []byte("app_hash"),
 	}).Once().Return(nil, errBoom)
 
@@ -436,10 +442,10 @@ func TestSyncer_offerSnapshot(t *testing.T) {
 			stateProvider := &mocks.StateProvider{}
 			stateProvider.On("AppHash", mock.Anything, mock.Anything).Return([]byte("app_hash"), nil)
 
-			rts := setup(ctx, t, nil, nil, stateProvider, 2)
+			rts := setup(ctx, t, nil, stateProvider, 2)
 
 			s := &snapshot{Height: 1, Format: 1, Chunks: 3, Hash: []byte{1, 2, 3}, trustedAppHash: []byte("app_hash")}
-			rts.conn.On("OfferSnapshotSync", mock.Anything, abci.RequestOfferSnapshot{
+			rts.conn.On("OfferSnapshot", mock.Anything, abci.RequestOfferSnapshot{
 				Snapshot: toABCI(s),
 				AppHash:  []byte("app_hash"),
 			}).Return(&abci.ResponseOfferSnapshot{Result: tc.result}, tc.err)
@@ -489,10 +495,10 @@ func TestSyncer_applyChunks_Results(t *testing.T) {
 			stateProvider := &mocks.StateProvider{}
 			stateProvider.On("AppHash", mock.Anything, mock.Anything).Return([]byte("app_hash"), nil)
 
-			rts := setup(ctx, t, nil, nil, stateProvider, 2)
+			rts := setup(ctx, t, nil, stateProvider, 2)
 
 			body := []byte{1, 2, 3}
-			chunks, err := newChunkQueue(&snapshot{Height: 1, Format: 1, Chunks: 1}, "")
+			chunks, err := newChunkQueue(&snapshot{Height: 1, Format: 1, Chunks: 1}, t.TempDir())
 			require.NoError(t, err)
 
 			fetchStartTime := time.Now()
@@ -500,11 +506,11 @@ func TestSyncer_applyChunks_Results(t *testing.T) {
 			_, err = chunks.Add(&chunk{Height: 1, Format: 1, Index: 0, Chunk: body})
 			require.NoError(t, err)
 
-			rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+			rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 				Index: 0, Chunk: body,
 			}).Once().Return(&abci.ResponseApplySnapshotChunk{Result: tc.result}, tc.err)
 			if tc.result == abci.ResponseApplySnapshotChunk_RETRY {
-				rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+				rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 					Index: 0, Chunk: body,
 				}).Once().Return(&abci.ResponseApplySnapshotChunk{
 					Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
@@ -549,9 +555,9 @@ func TestSyncer_applyChunks_RefetchChunks(t *testing.T) {
 			stateProvider := &mocks.StateProvider{}
 			stateProvider.On("AppHash", mock.Anything, mock.Anything).Return([]byte("app_hash"), nil)
 
-			rts := setup(ctx, t, nil, nil, stateProvider, 2)
+			rts := setup(ctx, t, nil, stateProvider, 2)
 
-			chunks, err := newChunkQueue(&snapshot{Height: 1, Format: 1, Chunks: 3}, "")
+			chunks, err := newChunkQueue(&snapshot{Height: 1, Format: 1, Chunks: 3}, t.TempDir())
 			require.NoError(t, err)
 
 			fetchStartTime := time.Now()
@@ -567,13 +573,13 @@ func TestSyncer_applyChunks_RefetchChunks(t *testing.T) {
 			require.NoError(t, err)
 
 			// The first two chunks are accepted, before the last one asks for 1 to be refetched
-			rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+			rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 				Index: 0, Chunk: []byte{0},
 			}).Once().Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
-			rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+			rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 				Index: 1, Chunk: []byte{1},
 			}).Once().Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
-			rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+			rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 				Index: 2, Chunk: []byte{2},
 			}).Once().Return(&abci.ResponseApplySnapshotChunk{
 				Result:        tc.result,
@@ -620,7 +626,7 @@ func TestSyncer_applyChunks_RejectSenders(t *testing.T) {
 			stateProvider := &mocks.StateProvider{}
 			stateProvider.On("AppHash", mock.Anything, mock.Anything).Return([]byte("app_hash"), nil)
 
-			rts := setup(ctx, t, nil, nil, stateProvider, 2)
+			rts := setup(ctx, t, nil, stateProvider, 2)
 
 			// Set up three peers across two snapshots, and ask for one of them to be banned.
 			// It should be banned from all snapshots.
@@ -649,7 +655,7 @@ func TestSyncer_applyChunks_RejectSenders(t *testing.T) {
 			_, err = rts.syncer.AddSnapshot(peerCID, s2)
 			require.NoError(t, err)
 
-			chunks, err := newChunkQueue(s1, "")
+			chunks, err := newChunkQueue(s1, t.TempDir())
 			require.NoError(t, err)
 
 			fetchStartTime := time.Now()
@@ -667,13 +673,13 @@ func TestSyncer_applyChunks_RejectSenders(t *testing.T) {
 			require.NoError(t, err)
 
 			// The first two chunks are accepted, before the last one asks for b sender to be rejected
-			rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+			rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 				Index: 0, Chunk: []byte{0}, Sender: "aa",
 			}).Once().Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
-			rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+			rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 				Index: 1, Chunk: []byte{1}, Sender: "bb",
 			}).Once().Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
-			rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+			rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 				Index: 2, Chunk: []byte{2}, Sender: "cc",
 			}).Once().Return(&abci.ResponseApplySnapshotChunk{
 				Result:        tc.result,
@@ -682,7 +688,7 @@ func TestSyncer_applyChunks_RejectSenders(t *testing.T) {
 
 			// On retry, the last chunk will be tried again, so we just accept it then.
 			if tc.result == abci.ResponseApplySnapshotChunk_RETRY {
-				rts.conn.On("ApplySnapshotChunkSync", mock.Anything, abci.RequestApplySnapshotChunk{
+				rts.conn.On("ApplySnapshotChunk", mock.Anything, abci.RequestApplySnapshotChunk{
 					Index: 2, Chunk: []byte{2}, Sender: "cc",
 				}).Once().Return(&abci.ResponseApplySnapshotChunk{Result: abci.ResponseApplySnapshotChunk_ACCEPT}, nil)
 			}
@@ -713,6 +719,8 @@ func TestSyncer_applyChunks_RejectSenders(t *testing.T) {
 
 func TestSyncer_verifyApp(t *testing.T) {
 	boom := errors.New("boom")
+	const appVersion = 9
+	appVersionMismatchErr := errors.New("app version mismatch. Expected: 9, got: 2")
 	s := &snapshot{Height: 3, Format: 1, Chunks: 5, Hash: []byte{1, 2, 3}, trustedAppHash: []byte("app_hash")}
 
 	testcases := map[string]struct {
@@ -723,17 +731,22 @@ func TestSyncer_verifyApp(t *testing.T) {
 		"verified": {&abci.ResponseInfo{
 			LastBlockHeight:  3,
 			LastBlockAppHash: []byte("app_hash"),
-			AppVersion:       9,
+			AppVersion:       appVersion,
 		}, nil, nil},
+		"invalid app version": {&abci.ResponseInfo{
+			LastBlockHeight:  3,
+			LastBlockAppHash: []byte("app_hash"),
+			AppVersion:       2,
+		}, nil, appVersionMismatchErr},
 		"invalid height": {&abci.ResponseInfo{
 			LastBlockHeight:  5,
 			LastBlockAppHash: []byte("app_hash"),
-			AppVersion:       9,
+			AppVersion:       appVersion,
 		}, nil, errVerifyFailed},
 		"invalid hash": {&abci.ResponseInfo{
 			LastBlockHeight:  3,
 			LastBlockAppHash: []byte("xxx"),
-			AppVersion:       9,
+			AppVersion:       appVersion,
 		}, nil, errVerifyFailed},
 		"error": {nil, boom, boom},
 	}
@@ -746,19 +759,15 @@ func TestSyncer_verifyApp(t *testing.T) {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
-			rts := setup(ctx, t, nil, nil, nil, 2)
+			rts := setup(ctx, t, nil, nil, 2)
 
-			rts.connQuery.On("InfoSync", mock.Anything, proxy.RequestInfo).Return(tc.response, tc.err)
-			version, err := rts.syncer.verifyApp(ctx, s)
+			rts.conn.On("Info", mock.Anything, proxy.RequestInfo).Return(tc.response, tc.err)
+			err := rts.syncer.verifyApp(ctx, s, appVersion)
 			unwrapped := errors.Unwrap(err)
 			if unwrapped != nil {
 				err = unwrapped
 			}
-
 			require.Equal(t, tc.expectErr, err)
-			if err == nil {
-				require.Equal(t, tc.response.AppVersion, version)
-			}
 		})
 	}
 }

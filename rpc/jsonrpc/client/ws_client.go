@@ -11,29 +11,25 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	metrics "github.com/rcrowley/go-metrics"
 
-	tmclient "github.com/tendermint/tendermint/rpc/client"
+	"github.com/tendermint/tendermint/libs/log"
 	rpctypes "github.com/tendermint/tendermint/rpc/jsonrpc/types"
 )
 
-// WSOptions for WSClient.
-type WSOptions struct {
+// wsOptions carries optional settings for a websocket connection.
+type wsOptions struct {
 	MaxReconnectAttempts uint          // maximum attempts to reconnect
 	ReadWait             time.Duration // deadline for any read op
 	WriteWait            time.Duration // deadline for any write op
 	PingPeriod           time.Duration // frequency with which pings are sent
-	SkipMetrics          bool          // do not keep metrics for ping/pong latency
 }
 
-// DefaultWSOptions returns default WS options.
-func DefaultWSOptions() WSOptions {
-	return WSOptions{
-		MaxReconnectAttempts: 10, // first: 2 sec, last: 17 min.
-		WriteWait:            10 * time.Second,
-		ReadWait:             0,
-		PingPeriod:           0,
-	}
+// defaultWSOptions are the default websocket connection settings.
+var defaultWSOptions = wsOptions{
+	MaxReconnectAttempts: 10, // first: 2 sec, last: 17 min.
+	WriteWait:            10 * time.Second,
+	ReadWait:             0,
+	PingPeriod:           0,
 }
 
 // WSClient is a JSON-RPC client, which uses WebSocket for communication with
@@ -41,8 +37,8 @@ func DefaultWSOptions() WSOptions {
 //
 // WSClient is safe for concurrent use by multiple goroutines.
 type WSClient struct { // nolint: maligned
-	*tmclient.RunState
-	conn *websocket.Conn
+	Logger log.Logger
+	conn   *websocket.Conn
 
 	Address  string // IP:PORT or /path/to/socket
 	Endpoint string // /websocket/url/endpoint
@@ -69,10 +65,9 @@ type WSClient struct { // nolint: maligned
 
 	wg sync.WaitGroup
 
-	mtx            sync.RWMutex
-	sentLastPingAt time.Time
-	reconnecting   bool
-	nextReqID      int
+	mtx          sync.RWMutex
+	reconnecting bool
+	nextReqID    int
 	// sentIDs        map[types.JSONRPCIntID]bool // IDs of the requests currently in flight
 
 	// Time allowed to write a message to the server. 0 means block until operation succeeds.
@@ -83,21 +78,12 @@ type WSClient struct { // nolint: maligned
 
 	// Send pings to server with this period. Must be less than readWait. If 0, no pings will be sent.
 	pingPeriod time.Duration
-
-	// Time between sending a ping and receiving a pong. See
-	// https://godoc.org/github.com/rcrowley/go-metrics#Timer.
-	PingPongLatencyTimer metrics.Timer
 }
 
-// NewWS returns a new client. The endpoint argument must begin with a `/`. An
-// error is returned on invalid remote.
-// It uses DefaultWSOptions.
+// NewWS returns a new client with default options. The endpoint argument must
+// begin with a `/`. An error is returned on invalid remote.
 func NewWS(remoteAddr, endpoint string) (*WSClient, error) {
-	return NewWSWithOptions(remoteAddr, endpoint, DefaultWSOptions())
-}
-
-// NewWSWithOptions allows you to provide custom WSOptions.
-func NewWSWithOptions(remoteAddr, endpoint string, opts WSOptions) (*WSClient, error) {
+	opts := defaultWSOptions
 	parsedURL, err := newParsedURL(remoteAddr)
 	if err != nil {
 		return nil, err
@@ -113,7 +99,7 @@ func NewWSWithOptions(remoteAddr, endpoint string, opts WSOptions) (*WSClient, e
 	}
 
 	c := &WSClient{
-		RunState:             tmclient.NewRunState("WSClient", nil),
+		Logger:               log.NewNopLogger(),
 		Address:              parsedURL.GetTrimmedHostWithPath(),
 		Dialer:               dialFn,
 		Endpoint:             endpoint,
@@ -125,14 +111,6 @@ func NewWSWithOptions(remoteAddr, endpoint string, opts WSOptions) (*WSClient, e
 
 		// sentIDs: make(map[types.JSONRPCIntID]bool),
 	}
-
-	switch opts.SkipMetrics {
-	case true:
-		c.PingPongLatencyTimer = metrics.NilTimer{}
-	case false:
-		c.PingPongLatencyTimer = metrics.NewTimer()
-	}
-
 	return c, nil
 }
 
@@ -148,13 +126,11 @@ func (c *WSClient) String() string {
 	return fmt.Sprintf("WSClient{%s (%s)}", c.Address, c.Endpoint)
 }
 
-// Start dials the specified service address and starts the I/O routines.
+// Start dials the specified service address and starts the I/O routines.  The
+// service routines run until ctx terminates. To wait for the client to exit
+// after ctx ends, call Stop.
 func (c *WSClient) Start(ctx context.Context) error {
-	if err := c.RunState.Start(ctx); err != nil {
-		return err
-	}
-	err := c.dial()
-	if err != nil {
+	if err := c.dial(); err != nil {
 		return err
 	}
 
@@ -174,16 +150,14 @@ func (c *WSClient) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop shuts down the client.
+// Stop blocks until the client is shut down and returns nil.
+//
+// TODO(creachadair): This method exists for compatibility with the original
+// service plumbing. Give it a better name (e.g., Wait).
 func (c *WSClient) Stop() error {
-	if err := c.RunState.Stop(); err != nil {
-		return err
-	}
-
 	// only close user-facing channels when we can't write to them
 	c.wg.Wait()
 	close(c.ResponsesCh)
-
 	return nil
 }
 
@@ -192,11 +166,6 @@ func (c *WSClient) IsReconnecting() bool {
 	c.mtx.RLock()
 	defer c.mtx.RUnlock()
 	return c.reconnecting
-}
-
-// IsActive returns true if the client is running and not reconnecting.
-func (c *WSClient) IsActive() bool {
-	return c.IsRunning() && !c.IsReconnecting()
 }
 
 // Send the given RPC request to the server. Results will be available on
@@ -217,31 +186,21 @@ func (c *WSClient) Send(ctx context.Context, request rpctypes.RPCRequest) error 
 
 // Call enqueues a call request onto the Send queue. Requests are JSON encoded.
 func (c *WSClient) Call(ctx context.Context, method string, params map[string]interface{}) error {
-	request, err := rpctypes.MapToRequest(c.nextRequestID(), method, params)
-	if err != nil {
+	req := rpctypes.NewRequest(c.nextRequestID())
+	if err := req.SetMethodAndParams(method, params); err != nil {
 		return err
 	}
-	return c.Send(ctx, request)
-}
-
-// CallWithArrayParams enqueues a call request onto the Send queue. Params are
-// in a form of array (e.g. []interface{}{"abcd"}). Requests are JSON encoded.
-func (c *WSClient) CallWithArrayParams(ctx context.Context, method string, params []interface{}) error {
-	request, err := rpctypes.ArrayToRequest(c.nextRequestID(), method, params)
-	if err != nil {
-		return err
-	}
-	return c.Send(ctx, request)
+	return c.Send(ctx, req)
 }
 
 // Private methods
 
-func (c *WSClient) nextRequestID() rpctypes.JSONRPCIntID {
+func (c *WSClient) nextRequestID() int {
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	id := c.nextReqID
 	c.nextReqID++
-	c.mtx.Unlock()
-	return rpctypes.JSONRPCIntID(id)
+	return id
 }
 
 func (c *WSClient) dial() error {
@@ -385,10 +344,6 @@ func (c *WSClient) writeRoutine(ctx context.Context) {
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
-		// err != nil {
-		// ignore error; it will trigger in tests
-		// likely because it's closing an already closed connection
-		// }
 		c.wg.Done()
 	}()
 
@@ -418,10 +373,6 @@ func (c *WSClient) writeRoutine(ctx context.Context) {
 				c.reconnectAfter <- err
 				return
 			}
-			c.mtx.Lock()
-			c.sentLastPingAt = time.Now()
-			c.mtx.Unlock()
-			c.Logger.Debug("sent ping")
 		case <-c.readRoutineQuit:
 			return
 		case <-ctx.Done():
@@ -441,23 +392,8 @@ func (c *WSClient) writeRoutine(ctx context.Context) {
 func (c *WSClient) readRoutine(ctx context.Context) {
 	defer func() {
 		c.conn.Close()
-		// err != nil {
-		// ignore error; it will trigger in tests
-		// likely because it's closing an already closed connection
-		// }
 		c.wg.Done()
 	}()
-
-	c.conn.SetPongHandler(func(string) error {
-		// gather latency stats
-		c.mtx.RLock()
-		t := c.sentLastPingAt
-		c.mtx.RUnlock()
-		c.PingPongLatencyTimer.UpdateSince(t)
-
-		c.Logger.Debug("got pong")
-		return nil
-	})
 
 	for {
 		// reset deadline for every message type (control or data)
@@ -485,24 +421,12 @@ func (c *WSClient) readRoutine(ctx context.Context) {
 			continue
 		}
 
-		if err = validateResponseID(response.ID); err != nil {
-			c.Logger.Error("error in response ID", "id", response.ID, "err", err)
-			continue
-		}
-
 		// TODO: events resulting from /subscribe do not work with ->
 		// because they are implemented as responses with the subscribe request's
 		// ID. According to the spec, they should be notifications (requests
 		// without IDs).
 		// https://github.com/tendermint/tendermint/issues/2949
-		// c.mtx.Lock()
-		// if _, ok := c.sentIDs[response.ID.(types.JSONRPCIntID)]; !ok {
-		// 	c.Logger.Error("unsolicited response ID", "id", response.ID, "expected", c.sentIDs)
-		// 	c.mtx.Unlock()
-		// 	continue
-		// }
-		// delete(c.sentIDs, response.ID.(types.JSONRPCIntID))
-		// c.mtx.Unlock()
+		//
 		// Combine a non-blocking read on BaseService.Quit with a non-blocking write on ResponsesCh to avoid blocking
 		// c.wg.Wait() in c.Stop(). Note we rely on Quit being closed so that it sends unlimited Quit signals to stop
 		// both readRoutine and writeRoutine

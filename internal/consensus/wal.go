@@ -12,8 +12,8 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 
+	"github.com/tendermint/tendermint/internal/jsontypes"
 	auto "github.com/tendermint/tendermint/internal/libs/autofile"
-	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
 	tmos "github.com/tendermint/tendermint/libs/os"
 	"github.com/tendermint/tendermint/libs/service"
@@ -41,15 +41,17 @@ type TimedWALMessage struct {
 // EndHeightMessage marks the end of the given height inside WAL.
 // @internal used by scripts/wal2json util.
 type EndHeightMessage struct {
-	Height int64 `json:"height"`
+	Height int64 `json:"height,string"`
 }
+
+func (EndHeightMessage) TypeTag() string { return "tendermint/wal/EndHeightMessage" }
 
 type WALMessage interface{}
 
 func init() {
-	tmjson.RegisterType(msgInfo{}, "tendermint/wal/MsgInfo")
-	tmjson.RegisterType(timeoutInfo{}, "tendermint/wal/TimeoutInfo")
-	tmjson.RegisterType(EndHeightMessage{}, "tendermint/wal/EndHeightMessage")
+	jsontypes.MustRegister(msgInfo{})
+	jsontypes.MustRegister(timeoutInfo{})
+	jsontypes.MustRegister(EndHeightMessage{})
 }
 
 //--------------------------------------------------------
@@ -65,7 +67,7 @@ type WAL interface {
 
 	// service methods
 	Start(context.Context) error
-	Stop() error
+	Stop()
 	Wait()
 }
 
@@ -90,13 +92,13 @@ var _ WAL = &BaseWAL{}
 
 // NewWAL returns a new write-ahead logger based on `baseWAL`, which implements
 // WAL. It's flushed and synced to disk every 2s and once when stopped.
-func NewWAL(logger log.Logger, walFile string, groupOptions ...func(*auto.Group)) (*BaseWAL, error) {
+func NewWAL(ctx context.Context, logger log.Logger, walFile string, groupOptions ...func(*auto.Group)) (*BaseWAL, error) {
 	err := tmos.EnsureDir(filepath.Dir(walFile), 0700)
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure WAL directory is in place: %w", err)
 	}
 
-	group, err := auto.OpenGroup(logger, walFile, groupOptions...)
+	group, err := auto.OpenGroup(ctx, logger, walFile, groupOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -162,15 +164,9 @@ func (wal *BaseWAL) FlushAndSync() error {
 func (wal *BaseWAL) OnStop() {
 	wal.flushTicker.Stop()
 	if err := wal.FlushAndSync(); err != nil {
-		if !errors.Is(err, service.ErrAlreadyStopped) {
-			wal.logger.Error("error on flush data to disk", "error", err)
-		}
+		wal.logger.Error("error on flush data to disk", "error", err)
 	}
-	if err := wal.group.Stop(); err != nil {
-		if !errors.Is(err, service.ErrAlreadyStopped) {
-			wal.logger.Error("error trying to stop wal", "error", err)
-		}
-	}
+	wal.group.Stop()
 	wal.group.Close()
 }
 
@@ -194,7 +190,7 @@ func (wal *BaseWAL) Write(msg WALMessage) error {
 	}
 
 	if err := wal.enc.Encode(&TimedWALMessage{tmtime.Now(), msg}); err != nil {
-		wal.logger.Error("Error writing msg to consensus wal. WARNING: recover may not be possible for the current height",
+		wal.logger.Error("error writing msg to consensus wal. WARNING: recover may not be possible for the current height",
 			"err", err, "msg", msg)
 		return err
 	}
@@ -377,14 +373,14 @@ func (dec *WALDecoder) Decode() (*TimedWALMessage, error) {
 		return nil, err
 	}
 	if err != nil {
-		return nil, DataCorruptionError{fmt.Errorf("failed to read checksum: %v", err)}
+		return nil, DataCorruptionError{fmt.Errorf("failed to read checksum: %w", err)}
 	}
 	crc := binary.BigEndian.Uint32(b)
 
 	b = make([]byte, 4)
 	_, err = dec.rd.Read(b)
 	if err != nil {
-		return nil, DataCorruptionError{fmt.Errorf("failed to read length: %v", err)}
+		return nil, DataCorruptionError{fmt.Errorf("failed to read length: %w", err)}
 	}
 	length := binary.BigEndian.Uint32(b)
 
@@ -410,7 +406,7 @@ func (dec *WALDecoder) Decode() (*TimedWALMessage, error) {
 	var res = new(tmcons.TimedWALMessage)
 	err = proto.Unmarshal(data, res)
 	if err != nil {
-		return nil, DataCorruptionError{fmt.Errorf("failed to decode data: %v", err)}
+		return nil, DataCorruptionError{fmt.Errorf("failed to decode data: %w", err)}
 	}
 
 	walMsg, err := WALFromProto(res.Msg)
@@ -436,5 +432,5 @@ func (nilWAL) SearchForEndHeight(height int64, options *WALSearchOptions) (rd io
 	return nil, false, nil
 }
 func (nilWAL) Start(context.Context) error { return nil }
-func (nilWAL) Stop() error                 { return nil }
+func (nilWAL) Stop()                       {}
 func (nilWAL) Wait()                       {}

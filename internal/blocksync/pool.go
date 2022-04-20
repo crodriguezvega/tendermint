@@ -86,7 +86,6 @@ type BlockPool struct {
 
 	requestsCh chan<- BlockRequest
 	errorsCh   chan<- peerError
-	exitedCh   chan struct{}
 
 	startHeight               int64
 	lastHundredBlockTimeStamp time.Time
@@ -109,7 +108,6 @@ func NewBlockPool(
 		height:       start,
 		startHeight:  start,
 		numPending:   0,
-		exitedCh:     make(chan struct{}),
 		requestsCh:   requestsCh,
 		errorsCh:     errorsCh,
 		lastSyncRate: 0,
@@ -124,11 +122,6 @@ func (pool *BlockPool) OnStart(ctx context.Context) error {
 	pool.lastAdvance = time.Now()
 	pool.lastHundredBlockTimeStamp = pool.lastAdvance
 	go pool.makeRequestersRoutine(ctx)
-
-	go func() {
-		defer close(pool.exitedCh)
-		pool.Wait()
-	}()
 
 	return nil
 }
@@ -168,7 +161,7 @@ func (pool *BlockPool) removeTimedoutPeers() {
 	for _, peer := range pool.peers {
 		// check if peer timed out
 		if !peer.didTimeout && peer.numPending > 0 {
-			curRate := peer.recvMonitor.Status().CurRate
+			curRate := peer.recvMonitor.CurrentTransferRate()
 			// curRate can be 0 on start
 			if curRate != 0 && curRate < minRecvRate {
 				err := errors.New("peer is not sending us data fast enough")
@@ -235,9 +228,7 @@ func (pool *BlockPool) PopRequest() {
 	defer pool.mtx.Unlock()
 
 	if r := pool.requesters[pool.height]; r != nil {
-		if err := r.Stop(); err != nil {
-			pool.logger.Error("Error stopping requester", "err", err)
-		}
+		r.Stop()
 		delete(pool.requesters, pool.height)
 		pool.height++
 		pool.lastAdvance = time.Now()
@@ -333,8 +324,16 @@ func (pool *BlockPool) SetPeerRange(peerID types.NodeID, base int64, height int6
 		peer.base = base
 		peer.height = height
 	} else {
-		peer = newBPPeer(pool, peerID, base, height)
-		peer.logger = pool.logger.With("peer", peerID)
+		peer = &bpPeer{
+			pool:       pool,
+			id:         peerID,
+			base:       base,
+			height:     height,
+			numPending: 0,
+			logger:     pool.logger.With("peer", peerID),
+			startAt:    time.Now(),
+		}
+
 		pool.peers[peerID] = peer
 	}
 
@@ -425,7 +424,7 @@ func (pool *BlockPool) makeNextRequester(ctx context.Context) {
 
 	err := request.Start(ctx)
 	if err != nil {
-		request.logger.Error("Error starting request", "err", err)
+		request.logger.Error("error starting request", "err", err)
 	}
 }
 
@@ -492,24 +491,13 @@ type bpPeer struct {
 	recvMonitor *flowrate.Monitor
 
 	timeout *time.Timer
+	startAt time.Time
 
 	logger log.Logger
 }
 
-func newBPPeer(pool *BlockPool, peerID types.NodeID, base int64, height int64) *bpPeer {
-	peer := &bpPeer{
-		pool:       pool,
-		id:         peerID,
-		base:       base,
-		height:     height,
-		numPending: 0,
-		logger:     log.NewNopLogger(),
-	}
-	return peer
-}
-
 func (peer *bpPeer) resetMonitor() {
-	peer.recvMonitor = flowrate.New(time.Second, time.Second*40)
+	peer.recvMonitor = flowrate.New(peer.startAt, time.Second, time.Second*40)
 	initialValue := float64(minRecvRate) * math.E
 	peer.recvMonitor.SetREMA(initialValue)
 }
@@ -642,12 +630,6 @@ func (bpr *bpRequester) redo(peerID types.NodeID) {
 // Responsible for making more requests as necessary
 // Returns only when a block is found (e.g. AddBlock() is called)
 func (bpr *bpRequester) requestRoutine(ctx context.Context) {
-	bprPoolDone := make(chan struct{})
-	go func() {
-		defer close(bprPoolDone)
-		bpr.pool.Wait()
-	}()
-
 OUTER_LOOP:
 	for {
 		// Pick a peer to send request to.
@@ -674,11 +656,6 @@ OUTER_LOOP:
 		for {
 			select {
 			case <-ctx.Done():
-				return
-			case <-bpr.pool.exitedCh:
-				if err := bpr.Stop(); err != nil {
-					bpr.logger.Error("Error stopped requester", "err", err)
-				}
 				return
 			case peerID := <-bpr.redoCh:
 				if peerID == bpr.peerID {

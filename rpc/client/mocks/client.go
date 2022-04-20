@@ -411,6 +411,29 @@ func (_m *Client) DumpConsensusState(_a0 context.Context) (*coretypes.ResultDump
 	return r0, r1
 }
 
+// Events provides a mock function with given fields: ctx, req
+func (_m *Client) Events(ctx context.Context, req *coretypes.RequestEvents) (*coretypes.ResultEvents, error) {
+	ret := _m.Called(ctx, req)
+
+	var r0 *coretypes.ResultEvents
+	if rf, ok := ret.Get(0).(func(context.Context, *coretypes.RequestEvents) *coretypes.ResultEvents); ok {
+		r0 = rf(ctx, req)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*coretypes.ResultEvents)
+		}
+	}
+
+	var r1 error
+	if rf, ok := ret.Get(1).(func(context.Context, *coretypes.RequestEvents) error); ok {
+		r1 = rf(ctx, req)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // Genesis provides a mock function with given fields: _a0
 func (_m *Client) Genesis(_a0 context.Context) (*coretypes.ResultGenesis, error) {
 	ret := _m.Called(_a0)
@@ -524,20 +547,6 @@ func (_m *Client) Health(_a0 context.Context) (*coretypes.ResultHealth, error) {
 	}
 
 	return r0, r1
-}
-
-// IsRunning provides a mock function with given fields:
-func (_m *Client) IsRunning() bool {
-	ret := _m.Called()
-
-	var r0 bool
-	if rf, ok := ret.Get(0).(func() bool); ok {
-		r0 = rf()
-	} else {
-		r0 = ret.Get(0).(bool)
-	}
-
-	return r0
 }
 
 // NetInfo provides a mock function with given fields: _a0
@@ -713,13 +722,13 @@ func (_m *Client) TxSearch(ctx context.Context, query string, prove bool, page *
 	return r0, r1
 }
 
-// UnconfirmedTxs provides a mock function with given fields: ctx, limit
-func (_m *Client) UnconfirmedTxs(ctx context.Context, limit *int) (*coretypes.ResultUnconfirmedTxs, error) {
-	ret := _m.Called(ctx, limit)
+// UnconfirmedTxs provides a mock function with given fields: ctx, page, perPage
+func (_m *Client) UnconfirmedTxs(ctx context.Context, page *int, perPage *int) (*coretypes.ResultUnconfirmedTxs, error) {
+	ret := _m.Called(ctx, page, perPage)
 
 	var r0 *coretypes.ResultUnconfirmedTxs
-	if rf, ok := ret.Get(0).(func(context.Context, *int) *coretypes.ResultUnconfirmedTxs); ok {
-		r0 = rf(ctx, limit)
+	if rf, ok := ret.Get(0).(func(context.Context, *int, *int) *coretypes.ResultUnconfirmedTxs); ok {
+		r0 = rf(ctx, page, perPage)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(*coretypes.ResultUnconfirmedTxs)
@@ -727,8 +736,8 @@ func (_m *Client) UnconfirmedTxs(ctx context.Context, limit *int) (*coretypes.Re
 	}
 
 	var r1 error
-	if rf, ok := ret.Get(1).(func(context.Context, *int) error); ok {
-		r1 = rf(ctx, limit)
+	if rf, ok := ret.Get(1).(func(context.Context, *int, *int) error); ok {
+		r1 = rf(ctx, page, perPage)
 	} else {
 		r1 = ret.Error(1)
 	}

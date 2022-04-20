@@ -150,7 +150,6 @@ type Router struct {
 
 	metrics            *Metrics
 	options            RouterOptions
-	nodeInfo           types.NodeInfo
 	privKey            crypto.PrivKey
 	peerManager        *PeerManager
 	chDescs            []*ChannelDescriptor
@@ -162,8 +161,9 @@ type Router struct {
 	peerMtx    sync.RWMutex
 	peerQueues map[types.NodeID]queue // outbound messages per peer for all channels
 	// the channels that the peer queue has open
-	peerChannels map[types.NodeID]channelIDs
-	queueFactory func(int) queue
+	peerChannels     map[types.NodeID]ChannelIDSet
+	queueFactory     func(int) queue
+	nodeInfoProducer func() *types.NodeInfo
 
 	// FIXME: We don't strictly need to use a mutex for this if we seal the
 	// channels on router start. This depends on whether we want to allow
@@ -177,12 +177,11 @@ type Router struct {
 // listening on appropriate interfaces, and will be closed by the Router when it
 // stops.
 func NewRouter(
-	ctx context.Context,
 	logger log.Logger,
 	metrics *Metrics,
-	nodeInfo types.NodeInfo,
 	privKey crypto.PrivKey,
 	peerManager *PeerManager,
+	nodeInfoProducer func() *types.NodeInfo,
 	transports []Transport,
 	endpoints []Endpoint,
 	options RouterOptions,
@@ -193,10 +192,10 @@ func NewRouter(
 	}
 
 	router := &Router{
-		logger:   logger,
-		metrics:  metrics,
-		nodeInfo: nodeInfo,
-		privKey:  privKey,
+		logger:           logger,
+		metrics:          metrics,
+		privKey:          privKey,
+		nodeInfoProducer: nodeInfoProducer,
 		connTracker: newConnTracker(
 			options.MaxIncomingConnectionAttempts,
 			options.IncomingConnectionWindow,
@@ -210,17 +209,10 @@ func NewRouter(
 		channelQueues:      map[ChannelID]queue{},
 		channelMessages:    map[ChannelID]proto.Message{},
 		peerQueues:         map[types.NodeID]queue{},
-		peerChannels:       make(map[types.NodeID]channelIDs),
+		peerChannels:       make(map[types.NodeID]ChannelIDSet),
 	}
 
 	router.BaseService = service.NewBaseService(logger, "router", router)
-
-	qf, err := router.createQueueFactory(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	router.queueFactory = qf
 
 	for _, transport := range transports {
 		for _, protocol := range transport.Protocols() {
@@ -254,6 +246,11 @@ func (r *Router) createQueueFactory(ctx context.Context) (func(int) queue, error
 	}
 }
 
+// ChannelCreator allows routers to construct their own channels,
+// either by receiving a reference to Router.OpenChannel or using some
+// kind shim for testing purposes.
+type ChannelCreator func(context.Context, *ChannelDescriptor) (*Channel, error)
+
 // OpenChannel opens a new channel for the given message type. The caller must
 // close the channel when done, before stopping the Router. messageType is the
 // type of message passed through the channel (used for unmarshaling), which can
@@ -276,6 +273,7 @@ func (r *Router) OpenChannel(ctx context.Context, chDesc *ChannelDescriptor) (*C
 	outCh := make(chan Envelope, chDesc.RecvBufferCapacity)
 	errCh := make(chan PeerError, chDesc.RecvBufferCapacity)
 	channel := NewChannel(id, messageType, queue.dequeue(), outCh, errCh)
+	channel.name = chDesc.Name
 
 	var wrapper Wrapper
 	if w, ok := messageType.(Wrapper); ok {
@@ -286,7 +284,7 @@ func (r *Router) OpenChannel(ctx context.Context, chDesc *ChannelDescriptor) (*C
 	r.channelMessages[id] = messageType
 
 	// add the channel to the nodeInfo if it's not already there.
-	r.nodeInfo.AddChannel(uint16(chDesc.ID))
+	r.nodeInfoProducer().AddChannel(uint16(chDesc.ID))
 
 	for _, t := range r.transports {
 		t.AddChannelDescriptors([]*ChannelDescriptor{chDesc})
@@ -467,8 +465,6 @@ func (r *Router) dialSleep(ctx context.Context) {
 // acceptPeers accepts inbound connections from peers on the given transport,
 // and spawns goroutines that route messages to/from them.
 func (r *Router) acceptPeers(ctx context.Context, transport Transport) {
-	r.logger.Debug("starting accept routine", "transport", transport)
-
 	for {
 		conn, err := transport.Accept(ctx)
 		switch err {
@@ -550,8 +546,6 @@ func (r *Router) openConnection(ctx context.Context, conn Connection) {
 
 // dialPeers maintains outbound connections to peers by dialing them.
 func (r *Router) dialPeers(ctx context.Context) {
-	r.logger.Debug("starting dial routine")
-
 	addresses := make(chan NodeAddress)
 	wg := &sync.WaitGroup{}
 
@@ -582,7 +576,6 @@ LOOP:
 		address, err := r.peerManager.DialNext(ctx)
 		switch {
 		case errors.Is(err, context.Canceled):
-			r.logger.Debug("stopping dial routine")
 			break LOOP
 		case err != nil:
 			r.logger.Error("failed to find next peer to dial", "err", err)
@@ -644,7 +637,7 @@ func (r *Router) connectPeer(ctx context.Context, address NodeAddress) {
 	go r.routePeer(ctx, address.NodeID, conn, toChannelIDs(peerInfo.Channels))
 }
 
-func (r *Router) getOrMakeQueue(peerID types.NodeID, channels channelIDs) queue {
+func (r *Router) getOrMakeQueue(peerID types.NodeID, channels ChannelIDSet) queue {
 	r.peerMtx.Lock()
 	defer r.peerMtx.Unlock()
 
@@ -722,7 +715,8 @@ func (r *Router) handshakePeer(
 		defer cancel()
 	}
 
-	peerInfo, peerKey, err := conn.Handshake(ctx, r.nodeInfo, r.privKey)
+	nodeInfo := r.nodeInfoProducer()
+	peerInfo, peerKey, err := conn.Handshake(ctx, *nodeInfo, r.privKey)
 	if err != nil {
 		return peerInfo, err
 	}
@@ -737,7 +731,7 @@ func (r *Router) handshakePeer(
 		return peerInfo, fmt.Errorf("expected to connect with peer %q, got %q",
 			expectID, peerInfo.NodeID)
 	}
-	if err := r.nodeInfo.CompatibleWith(peerInfo); err != nil {
+	if err := r.nodeInfoProducer().CompatibleWith(peerInfo); err != nil {
 		return peerInfo, ErrRejected{
 			err:            err,
 			id:             peerInfo.ID(),
@@ -756,9 +750,9 @@ func (r *Router) runWithPeerMutex(fn func() error) error {
 // routePeer routes inbound and outbound messages between a peer and the reactor
 // channels. It will close the given connection and send queue when done, or if
 // they are closed elsewhere it will cause this method to shut down and return.
-func (r *Router) routePeer(ctx context.Context, peerID types.NodeID, conn Connection, channels channelIDs) {
+func (r *Router) routePeer(ctx context.Context, peerID types.NodeID, conn Connection, channels ChannelIDSet) {
 	r.metrics.Peers.Add(1)
-	r.peerManager.Ready(ctx, peerID)
+	r.peerManager.Ready(ctx, peerID, channels)
 
 	sendQueue := r.getOrMakeQueue(peerID, channels)
 	defer func() {
@@ -912,16 +906,12 @@ func (r *Router) sendPeer(ctx context.Context, peerID types.NodeID, conn Connect
 
 // evictPeers evicts connected peers as requested by the peer manager.
 func (r *Router) evictPeers(ctx context.Context) {
-	r.logger.Debug("starting evict routine")
-
 	for {
 		peerID, err := r.peerManager.EvictNext(ctx)
 
 		switch {
 		case errors.Is(err, context.Canceled):
-			r.logger.Debug("stopping evict routine")
 			return
-
 		case err != nil:
 			r.logger.Error("failed to find next peer to evict", "err", err)
 			return
@@ -941,11 +931,25 @@ func (r *Router) evictPeers(ctx context.Context) {
 
 // NodeInfo returns a copy of the current NodeInfo. Used for testing.
 func (r *Router) NodeInfo() types.NodeInfo {
-	return r.nodeInfo.Copy()
+	return r.nodeInfoProducer().Copy()
+}
+
+func (r *Router) setupQueueFactory(ctx context.Context) error {
+	qf, err := r.createQueueFactory(ctx)
+	if err != nil {
+		return err
+	}
+
+	r.queueFactory = qf
+	return nil
 }
 
 // OnStart implements service.Service.
 func (r *Router) OnStart(ctx context.Context) error {
+	if err := r.setupQueueFactory(ctx); err != nil {
+		return err
+	}
+
 	for _, transport := range r.transports {
 		for _, endpoint := range r.endpoints {
 			if err := transport.Listen(endpoint); err != nil {
@@ -954,11 +958,12 @@ func (r *Router) OnStart(ctx context.Context) error {
 		}
 	}
 
+	nodeInfo := r.nodeInfoProducer()
 	r.logger.Info(
 		"starting router",
-		"node_id", r.nodeInfo.NodeID,
-		"channels", r.nodeInfo.Channels,
-		"listen_addr", r.nodeInfo.ListenAddr,
+		"node_id", nodeInfo.NodeID,
+		"channels", nodeInfo.Channels,
+		"listen_addr", nodeInfo.ListenAddr,
 		"transports", len(r.transports),
 	)
 
@@ -1007,9 +1012,14 @@ func (r *Router) OnStop() {
 	}
 }
 
-type channelIDs map[ChannelID]struct{}
+type ChannelIDSet map[ChannelID]struct{}
 
-func toChannelIDs(bytes []byte) channelIDs {
+func (cs ChannelIDSet) Contains(id ChannelID) bool {
+	_, ok := cs[id]
+	return ok
+}
+
+func toChannelIDs(bytes []byte) ChannelIDSet {
 	c := make(map[ChannelID]struct{}, len(bytes))
 	for _, b := range bytes {
 		c[ChannelID(b)] = struct{}{}

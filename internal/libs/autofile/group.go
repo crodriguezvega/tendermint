@@ -69,23 +69,18 @@ type Group struct {
 	minIndex           int // Includes head
 	maxIndex           int // Includes head, where Head will move to
 
-	// close this when the processTicks routine is done.
-	// this ensures we can cleanup the dir after calling Stop
-	// and the routine won't be trying to access it anymore
-	doneProcessTicks chan struct{}
-
 	// TODO: When we start deleting files, we need to start tracking GroupReaders
 	// and their dependencies.
 }
 
 // OpenGroup creates a new Group with head at headPath. It returns an error if
 // it fails to open head file.
-func OpenGroup(logger log.Logger, headPath string, groupOptions ...func(*Group)) (*Group, error) {
+func OpenGroup(ctx context.Context, logger log.Logger, headPath string, groupOptions ...func(*Group)) (*Group, error) {
 	dir, err := filepath.Abs(filepath.Dir(headPath))
 	if err != nil {
 		return nil, err
 	}
-	head, err := OpenAutoFile(headPath)
+	head, err := OpenAutoFile(ctx, headPath)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +96,6 @@ func OpenGroup(logger log.Logger, headPath string, groupOptions ...func(*Group))
 		groupCheckDuration: defaultGroupCheckDuration,
 		minIndex:           0,
 		maxIndex:           0,
-		doneProcessTicks:   make(chan struct{}),
 	}
 
 	for _, option := range groupOptions {
@@ -150,25 +144,18 @@ func (g *Group) OnStart(ctx context.Context) error {
 func (g *Group) OnStop() {
 	g.ticker.Stop()
 	if err := g.FlushAndSync(); err != nil {
-		g.logger.Error("Error flushing to disk", "err", err)
+		g.logger.Error("error flushing to disk", "err", err)
 	}
-}
-
-// Wait blocks until all internal goroutines are finished. Supposed to be
-// called after Stop.
-func (g *Group) Wait() {
-	// wait for processTicks routine to finish
-	<-g.doneProcessTicks
 }
 
 // Close closes the head file. The group must be stopped by this moment.
 func (g *Group) Close() {
 	if err := g.FlushAndSync(); err != nil {
-		g.logger.Error("Error flushing to disk", "err", err)
+		g.logger.Error("error flushing to disk", "err", err)
 	}
 
 	g.mtx.Lock()
-	_ = g.Head.closeFile()
+	_ = g.Head.Close()
 	g.mtx.Unlock()
 }
 
@@ -241,21 +228,19 @@ func (g *Group) FlushAndSync() error {
 }
 
 func (g *Group) processTicks(ctx context.Context) {
-	defer close(g.doneProcessTicks)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-g.ticker.C:
-			g.checkHeadSizeLimit()
-			g.checkTotalSizeLimit()
+			g.checkHeadSizeLimit(ctx)
+			g.checkTotalSizeLimit(ctx)
 		}
 	}
 }
 
 // NOTE: this function is called manually in tests.
-func (g *Group) checkHeadSizeLimit() {
+func (g *Group) checkHeadSizeLimit(ctx context.Context) {
 	limit := g.HeadSizeLimit()
 	if limit == 0 {
 		return
@@ -266,13 +251,19 @@ func (g *Group) checkHeadSizeLimit() {
 		return
 	}
 	if size >= limit {
-		g.RotateFile()
+		g.rotateFile(ctx)
 	}
 }
 
-func (g *Group) checkTotalSizeLimit() {
-	limit := g.TotalSizeLimit()
-	if limit == 0 {
+func (g *Group) checkTotalSizeLimit(ctx context.Context) {
+	g.mtx.Lock()
+	defer g.mtx.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return
+	}
+
+	if g.totalSizeLimit == 0 {
 		return
 	}
 
@@ -280,7 +271,7 @@ func (g *Group) checkTotalSizeLimit() {
 	totalSize := gInfo.TotalSize
 	for i := 0; i < maxFilesToRemove; i++ {
 		index := gInfo.MinIndex + i
-		if totalSize < limit {
+		if totalSize < g.totalSizeLimit {
 			return
 		}
 		if index == gInfo.MaxIndex {
@@ -288,14 +279,23 @@ func (g *Group) checkTotalSizeLimit() {
 			g.logger.Error("Group's head may grow without bound", "head", g.Head.Path)
 			return
 		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
 		pathToRemove := filePathForIndex(g.Head.Path, index, gInfo.MaxIndex)
 		fInfo, err := os.Stat(pathToRemove)
 		if err != nil {
 			g.logger.Error("Failed to fetch info for file", "file", pathToRemove)
 			continue
 		}
-		err = os.Remove(pathToRemove)
-		if err != nil {
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		if err = os.Remove(pathToRemove); err != nil {
 			g.logger.Error("Failed to remove path", "path", pathToRemove)
 			return
 		}
@@ -303,28 +303,40 @@ func (g *Group) checkTotalSizeLimit() {
 	}
 }
 
-// RotateFile causes group to close the current head and assign it some index.
-// Note it does not create a new head.
-func (g *Group) RotateFile() {
+// rotateFile causes group to close the current head and assign it
+// some index. Panics if it encounters an error.
+func (g *Group) rotateFile(ctx context.Context) {
 	g.mtx.Lock()
 	defer g.mtx.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return
+	}
 
 	headPath := g.Head.Path
 
 	if err := g.headBuf.Flush(); err != nil {
 		panic(err)
 	}
-
 	if err := g.Head.Sync(); err != nil {
 		panic(err)
 	}
+	err := g.Head.withLock(func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
-	if err := g.Head.closeFile(); err != nil {
-		panic(err)
+		if err := g.Head.unsyncCloseFile(); err != nil {
+			return err
+		}
+
+		indexPath := filePathForIndex(headPath, g.maxIndex, g.maxIndex+1)
+		return os.Rename(headPath, indexPath)
+	})
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
 	}
-
-	indexPath := filePathForIndex(headPath, g.maxIndex, g.maxIndex+1)
-	if err := os.Rename(headPath, indexPath); err != nil {
+	if err != nil {
 		panic(err)
 	}
 

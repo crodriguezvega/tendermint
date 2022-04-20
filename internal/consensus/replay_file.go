@@ -74,7 +74,7 @@ func (cs *State) ReplayFile(ctx context.Context, file string, console bool) erro
 	defer func() {
 		args := tmpubsub.UnsubscribeArgs{Subscriber: subscriber, Query: types.EventQueryNewRoundStep}
 		if err := cs.eventBus.Unsubscribe(ctx, args); err != nil {
-			cs.logger.Error("Error unsubscribing to event bus", "err", err)
+			cs.logger.Error("error unsubscribing to event bus", "err", err)
 		}
 	}()
 
@@ -84,7 +84,7 @@ func (cs *State) ReplayFile(ctx context.Context, file string, console bool) erro
 		return err
 	}
 
-	pb := newPlayback(file, fp, cs, cs.state.Copy())
+	pb := newPlayback(file, fp, cs, cs.stateStore)
 	defer pb.fp.Close()
 
 	var nextN int // apply N msgs in a row
@@ -126,30 +126,30 @@ type playback struct {
 	count int // how many lines/msgs into the file are we
 
 	// replays can be reset to beginning
-	fileName     string   // so we can close/reopen the file
-	genesisState sm.State // so the replay session knows where to restart from
+	fileName   string // so we can close/reopen the file
+	stateStore sm.Store
 }
 
-func newPlayback(fileName string, fp *os.File, cs *State, genState sm.State) *playback {
+func newPlayback(fileName string, fp *os.File, cs *State, store sm.Store) *playback {
 	return &playback{
-		cs:           cs,
-		fp:           fp,
-		fileName:     fileName,
-		genesisState: genState,
-		dec:          NewWALDecoder(fp),
+		cs:         cs,
+		fp:         fp,
+		fileName:   fileName,
+		stateStore: store,
+		dec:        NewWALDecoder(fp),
 	}
 }
 
 // go back count steps by resetting the state and running (pb.count - count) steps
 func (pb *playback) replayReset(ctx context.Context, count int, newStepSub eventbus.Subscription) error {
-	if err := pb.cs.Stop(); err != nil {
-		return err
-	}
+	pb.cs.Stop()
 	pb.cs.Wait()
 
-	newCS := NewState(ctx, pb.cs.logger, pb.cs.config, pb.genesisState.Copy(), pb.cs.blockExec,
-		pb.cs.blockStore, pb.cs.txNotifier, pb.cs.evpool)
-	newCS.SetEventBus(pb.cs.eventBus)
+	newCS, err := NewState(pb.cs.logger, pb.cs.config, pb.stateStore, pb.cs.blockExec,
+		pb.cs.blockStore, pb.cs.txNotifier, pb.cs.evpool, pb.cs.eventBus)
+	if err != nil {
+		return err
+	}
 	newCS.startForReplay()
 
 	if err := pb.fp.Close(); err != nil {
@@ -237,7 +237,7 @@ func (pb *playback) replayConsoleLoop(ctx context.Context) (int, error) {
 			defer func() {
 				args := tmpubsub.UnsubscribeArgs{Subscriber: subscriber, Query: types.EventQueryNewRoundStep}
 				if err := pb.cs.eventBus.Unsubscribe(ctx, args); err != nil {
-					pb.cs.logger.Error("Error unsubscribing from eventBus", "err", err)
+					pb.cs.logger.Error("error unsubscribing from eventBus", "err", err)
 				}
 			}()
 
@@ -325,9 +325,12 @@ func newConsensusStateForReplay(
 		return nil, err
 	}
 
-	// Create proxyAppConn connection (consensus, mempool, query)
-	clientCreator, _ := proxy.DefaultClientCreator(logger, cfg.ProxyApp, cfg.ABCI, cfg.DBDir())
-	proxyApp := proxy.NewAppConns(clientCreator, logger, proxy.NopMetrics())
+	client, _, err := proxy.ClientFactory(logger, cfg.ProxyApp, cfg.ABCI, cfg.DBDir())
+	if err != nil {
+		return nil, err
+	}
+
+	proxyApp := proxy.New(client, logger, proxy.NopMetrics())
 	err = proxyApp.Start(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("starting proxy app conns: %w", err)
@@ -345,11 +348,12 @@ func newConsensusStateForReplay(
 	}
 
 	mempool, evpool := emptyMempool{}, sm.EmptyEvidencePool{}
-	blockExec := sm.NewBlockExecutor(stateStore, logger, proxyApp.Consensus(), mempool, evpool, blockStore)
+	blockExec := sm.NewBlockExecutor(stateStore, logger, proxyApp, mempool, evpool, blockStore, eventBus, sm.NopMetrics())
 
-	consensusState := NewState(ctx, logger, csConfig, state.Copy(), blockExec,
-		blockStore, mempool, evpool)
-
-	consensusState.SetEventBus(eventBus)
+	consensusState, err := NewState(logger, csConfig, stateStore, blockExec,
+		blockStore, mempool, evpool, eventBus)
+	if err != nil {
+		return nil, err
+	}
 	return consensusState, nil
 }
